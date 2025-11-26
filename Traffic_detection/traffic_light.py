@@ -265,3 +265,109 @@ def register_yolo_tl_classification(results, model_names):
                 tl_results[tuple(xyxy)] = {'color': 'UNKNOWN', 'conf': conf}
     
     return tl_results
+
+# === 红绿灯检测结果输出接口 ===
+def output_traffic_light_results(tl_results, image_rgb=None, output_format='print', output_path=None):
+    """
+    输出红绿灯检测结果的接口
+    
+    Args:
+        tl_results: 红绿灯检测结果字典，格式为 {bbox_tuple: {'color': color_str, 'conf': confidence}}
+        image_rgb: (可选) RGB图像，用于可视化
+        output_format: 输出格式，可选 'print' (打印到控制台)、'json' (返回JSON对象)、'image' (可视化到图像)
+        output_path: (可选) 当output_format为'image'时，保存图像的路径
+        
+    Returns:
+        根据output_format返回不同内容：
+        - 'print': None (直接打印到控制台)
+        - 'json': dict (JSON格式的检测结果)
+        - 'image': numpy array (可视化后的图像)
+    """
+    if not tl_results:
+        if output_format == 'print':
+            print("未检测到红绿灯")
+        elif output_format == 'json':
+            return {"detections": [], "count": 0}
+        elif output_format == 'image' and image_rgb is not None:
+            return image_rgb.copy()
+        return None
+    
+    # 准备JSON格式结果
+    json_results = {
+        "detections": [],
+        "count": len(tl_results)
+    }
+    
+    for bbox, info in tl_results.items():
+        detection = {
+            "bbox": list(bbox),
+            "color": info['color'],
+            "confidence": info['conf']
+        }
+        json_results["detections"].append(detection)
+    
+    # 根据输出格式处理结果
+    if output_format == 'print':
+        print(f"检测到 {len(tl_results)} 个红绿灯:")
+        for i, (bbox, info) in enumerate(tl_results.items(), 1):
+            x1, y1, x2, y2 = bbox
+            print(f"  {i}. 位置: [{x1}, {y1}, {x2}, {y2}], 颜色: {info['color']}, 置信度: {info['conf']:.2f}")
+        return None
+    
+    elif output_format == 'json':
+        return json_results
+    
+    elif output_format == 'image' and image_rgb is not None:
+        # 创建图像副本进行可视化
+        result_image = image_rgb.copy()
+        
+        for bbox, info in tl_results.items():
+            x1, y1, x2, y2 = bbox
+            color = COLOR_MAP.get(info['color'], COLOR_MAP["UNKNOWN"])
+            
+            # 绘制边界框
+            cv2.rectangle(result_image, (x1, y1), (x2, y2), color, 2)
+            
+            # 绘制标签
+            label = f"{info['color']}: {info['conf']:.2f}"
+            cv2.putText(result_image, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # 保存图像（如果指定了路径）
+        if output_path:
+            # 转换为BGR格式保存
+            result_image_bgr = cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(output_path, result_image_bgr)
+            print(f"结果图像已保存至: {output_path}")
+        
+        return result_image
+    
+    return None
+
+# === 综合红绿灯检测接口 ===
+def detect_traffic_lights(image_rgb, yolo_results=None, model_names=None, method='deep_learning'):
+    """
+    综合红绿灯检测接口，整合YOLO检测和颜色分析
+    
+    Args:
+        image_rgb: RGB图像
+        yolo_results: (可选) YOLO检测结果
+        model_names: (可选) YOLO模型类别名称字典
+        method: 颜色分析方法，可选 'deep_learning' 或 'hsv'
+        
+    Returns:
+        dict: 红绿灯检测结果字典
+    """
+    tl_results = {}
+    
+    # 如果提供了YOLO结果，优先处理
+    if yolo_results is not None and model_names is not None:
+        tl_results = register_yolo_tl_classification(yolo_results, model_names)
+        
+        # 对颜色为UNKNOWN的红绿灯使用指定方法进行颜色分析
+        for bbox, info in tl_results.items():
+            if info['color'] == 'UNKNOWN':
+                color_str, _ = get_traffic_light_color(image_rgb, list(bbox), method)
+                tl_results[bbox]['color'] = color_str
+    
+    return tl_results
