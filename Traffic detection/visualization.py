@@ -5,10 +5,50 @@ import carla
 import utils
 import traffic_light  # 引入新模块
 
-def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb):
+def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detection_method='deep_learning'):
     """
-    专门用于绘制红绿灯及其颜色状态
+    专门用于绘制红绿灯及其颜色状态，支持深度学习方法和YOLO直接分类功能
+    
+    Args:
+        surface: Pygame显示表面
+        font: 字体对象
+        yolo_results: YOLO检测结果
+        yolo_model: YOLO模型对象
+        img_rgb: RGB图像数组
+        detection_method: 颜色检测方法，可选 'deep_learning' 或 'hsv'
     """
+    # 首先尝试使用YOLO直接分类功能
+    tl_results = traffic_light.register_yolo_tl_classification(yolo_results, yolo_model.names)
+    
+    # 处理有直接分类结果的红绿灯
+    for bbox_tuple, result in tl_results.items():
+        x1, y1, x2, y2 = bbox_tuple
+        color_str = result['color']
+        conf = result['conf']
+        
+        # 如果YOLO没有直接给出颜色，使用我们的颜色检测方法
+        if color_str == 'UNKNOWN' and detection_method:
+            color_str, box_color = traffic_light.get_traffic_light_color(
+                img_rgb, [x1, y1, x2, y2], method=detection_method
+            )
+        else:
+            box_color = traffic_light.COLOR_MAP.get(color_str, traffic_light.COLOR_MAP['UNKNOWN'])
+        
+        w = x2 - x1
+        h = y2 - y1
+        
+        # 绘制框
+        pygame.draw.rect(surface, box_color, pygame.Rect(x1, y1, w, h), 2)
+        
+        # 绘制标签
+        label = f"TL: {color_str} ({conf:.2f})"
+        text_surface = font.render(label, True, (255, 255, 255), box_color)
+        
+        # 稍微向上偏移，避免遮挡车辆标签
+        text_rect = text_surface.get_rect(bottomleft=(x1, y1 - 25)) 
+        surface.blit(text_surface, text_rect)
+    
+    # 遍历剩余的检测结果，确保没有遗漏任何红绿灯
     for r in yolo_results:
         # 获取所有框的数据
         boxes = r.boxes.xyxy.cpu().numpy().astype(int)
@@ -16,6 +56,12 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb):
         confs = r.boxes.conf.cpu().numpy().astype(float)
 
         for box, class_id, conf in zip(boxes, class_ids, confs):
+            x1, y1, x2, y2 = box
+            
+            # 检查此红绿灯是否已经处理过
+            if (x1, y1, x2, y2) in tl_results:
+                continue
+                
             # 1. 类别过滤
             class_name = yolo_model.names.get(class_id)
             if class_name != traffic_light.YOLO_TARGET_CLASS:
@@ -25,11 +71,9 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb):
                 continue
             
             # 2. 调用算法判断颜色
-            # box is [x1, y1, x2, y2]
-            color_str, box_color = traffic_light.get_traffic_light_color(img_rgb, box)
+            color_str, box_color = traffic_light.get_traffic_light_color(img_rgb, box, method=detection_method)
             
             # 3. 绘制
-            x1, y1, x2, y2 = box
             w = x2 - x1
             h = y2 - y1
             
@@ -37,7 +81,7 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb):
             pygame.draw.rect(surface, box_color, pygame.Rect(x1, y1, w, h), 2)
             
             # 绘制标签
-            label = f"TL: {color_str} {conf:.2f}"
+            label = f"TL: {color_str} ({conf:.2f})"
             text_surface = font.render(label, True, (255, 255, 255), box_color)
             
             # 稍微向上偏移，避免遮挡车辆标签

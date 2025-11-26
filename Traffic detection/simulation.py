@@ -53,6 +53,13 @@ class CarlaYoloRunner(object):
         self.last_inference_time = 0.0
         self.vehicle_tracker = tracker.VehicleTracker(dt=0.05)
         
+        # 红绿灯检测方法
+        self.tl_detection_method = args.tl_method if hasattr(args, 'tl_method') else 'deep_learning'
+        # 确保方法有效
+        if self.tl_detection_method not in ['deep_learning', 'hsv']:
+            logging.warning(f"无效的红绿灯检测方法 '{self.tl_detection_method}'，使用默认值 'deep_learning'")
+            self.tl_detection_method = 'deep_learning'
+        
     def _init_pygame(self):
         """初始化 Pygame"""
         logging.info("初始化 Pygame...")
@@ -239,7 +246,8 @@ class CarlaYoloRunner(object):
             
             # 任务 B: 红绿灯检测与颜色识别 (新增)
             visualization.draw_traffic_lights(
-                self.display, self.yolo_font, yolo_results, self.model, img_rgb
+                self.display, self.yolo_font, yolo_results, self.model, img_rgb,
+                detection_method=self.tl_detection_method
             )
 
             # --- 4. 绘制帧率 ---

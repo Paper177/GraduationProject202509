@@ -668,15 +668,15 @@ def main():
     argparser.add_argument('-p', '--port', metavar='P', default=2000, type=int, help='TCP端口 (default: 2000)')
     argparser.add_argument('--res', metavar='WIDTHxHEIGHT', default='1280x720',
                            help='窗口分辨率')
-    argparser.add_argument('--yolo-model', metavar='PATH', required=True,
-                           help='YOLO 模型文件路径 (e.g., yolov11n.pt)')
+    argparser.add_argument('--yolo-model', metavar='PATH', default='YoloModel/yolo11s.pt',
+                           help='YOLO 模型文件路径 (默认: YoloModel/yolo11s.pt)')
 
     argparser.add_argument('--tm-port', metavar='P', default=8000, type=int,
                            help='交通管理器(TM)端口 (default: 8000)')
-    argparser.add_argument('-n', '--num-vehicles', metavar='N', default=30, type=int,
-                           help='生成的NPC车辆数量 (default: 30)')
-    argparser.add_argument('-w', '--num-walkers', metavar='W', default=15, type=int,
-                           help='生成的NPC行人数量 (default: 15)')
+    argparser.add_argument('-n', '--num-vehicles', metavar='N', default=50, type=int,
+                           help='生成的NPC车辆数量 (default: 50)')
+    argparser.add_argument('-w', '--num-walkers', metavar='W', default=50, type=int,
+                           help='生成的NPC行人数量 (default: 50)')
     
     args = argparser.parse_args()
         
