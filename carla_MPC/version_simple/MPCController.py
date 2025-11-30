@@ -3,11 +3,21 @@ import cvxpy
 import math
 import numpy as np
 import sys
+import os
 import matplotlib.pyplot as plt
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
-from interpolate import calc_spline_course_carla  # 注意导入路径，或者直接粘到项目里
-from new import adaptive_mpc_matrices
+
+# 添加项目根目录到系统路径
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# 使用相对路径导入
+try:
+    from src.interpolate import calc_spline_course_carla
+    from simulation.vehicle_control import adaptive_mpc_matrices
+except ImportError as e:
+    print(f"Error importing modules: {e}")
+    sys.exit(1)
 # State dimensions
 NX = 4  # x = x, y, v, yaw
 NU = 2  # a = [accel, steer]
@@ -409,7 +419,7 @@ for this_wp, _ in way_points:
     waypoints_y.append(this_wp.transform.location.y)
 
 # 使用三次样条拟合轨迹
-from cubic_spline_planner import calc_spline_course_carla  # 注意导入路径，或者直接粘到项目里
+# 已经从src.interpolate导入了calc_spline_course_carla，直接使用即可
 
 # ds=0.5表示每隔0.5m采样一个轨迹点，可以根据需要调
 cx, cy, cyaw, ck, s = calc_spline_course_carla(waypoints_x, waypoints_y, yaw=math.radians(way_points[0][0].transform.rotation.yaw), ds=0.5)

@@ -266,82 +266,19 @@ def register_yolo_tl_classification(results, model_names):
     
     return tl_results
 
-# === 红绿灯检测结果输出接口 ===
-def output_traffic_light_results(tl_results, image_rgb=None, output_format='print', output_path=None):
+def get_tl_colors(tl_results):
     """
-    输出红绿灯检测结果的接口
+    从红绿灯检测结果中提取颜色列表
     
     Args:
-        tl_results: 红绿灯检测结果字典，格式为 {bbox_tuple: {'color': color_str, 'conf': confidence}}
-        image_rgb: (可选) RGB图像，用于可视化
-        output_format: 输出格式，可选 'print' (打印到控制台)、'json' (返回JSON对象)、'image' (可视化到图像)
-        output_path: (可选) 当output_format为'image'时，保存图像的路径
+        tl_results: 红绿灯检测结果字典，格式为 {bbox_tuple: {'color': color_str, ...}}
         
     Returns:
-        根据output_format返回不同内容：
-        - 'print': None (直接打印到控制台)
-        - 'json': dict (JSON格式的检测结果)
-        - 'image': numpy array (可视化后的图像)
+        list: 颜色名称字符串列表，如 ['RED', 'GREEN']
     """
     if not tl_results:
-        if output_format == 'print':
-            print("未检测到红绿灯")
-        elif output_format == 'json':
-            return {"detections": [], "count": 0}
-        elif output_format == 'image' and image_rgb is not None:
-            return image_rgb.copy()
-        return None
-    
-    # 准备JSON格式结果
-    json_results = {
-        "detections": [],
-        "count": len(tl_results)
-    }
-    
-    for bbox, info in tl_results.items():
-        detection = {
-            "bbox": list(bbox),
-            "color": info['color'],
-            "confidence": info['conf']
-        }
-        json_results["detections"].append(detection)
-    
-    # 根据输出格式处理结果
-    if output_format == 'print':
-        print(f"检测到 {len(tl_results)} 个红绿灯:")
-        for i, (bbox, info) in enumerate(tl_results.items(), 1):
-            x1, y1, x2, y2 = bbox
-            print(f"  {i}. 位置: [{x1}, {y1}, {x2}, {y2}], 颜色: {info['color']}, 置信度: {info['conf']:.2f}")
-        return None
-    
-    elif output_format == 'json':
-        return json_results
-    
-    elif output_format == 'image' and image_rgb is not None:
-        # 创建图像副本进行可视化
-        result_image = image_rgb.copy()
-        
-        for bbox, info in tl_results.items():
-            x1, y1, x2, y2 = bbox
-            color = COLOR_MAP.get(info['color'], COLOR_MAP["UNKNOWN"])
-            
-            # 绘制边界框
-            cv2.rectangle(result_image, (x1, y1), (x2, y2), color, 2)
-            
-            # 绘制标签
-            label = f"{info['color']}: {info['conf']:.2f}"
-            cv2.putText(result_image, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
-        # 保存图像（如果指定了路径）
-        if output_path:
-            # 转换为BGR格式保存
-            result_image_bgr = cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(output_path, result_image_bgr)
-            print(f"结果图像已保存至: {output_path}")
-        
-        return result_image
-    
+        return []
+    return [info['color'] for info in tl_results.values()]
     return None
 
 # === 综合红绿灯检测接口 ===

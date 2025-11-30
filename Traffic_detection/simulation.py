@@ -96,7 +96,7 @@ class CarlaYoloRunner(object):
         logging.info("正在加载地图 Town05...")
         self.world = self.client.load_world('Town05')
 
-        trafficmanager_port = self.args.trafficmanager_port
+        trafficmanager_port = self.args.tm_port
         logging.info(f"正在连接到交通管理器 (端口: {trafficmanager_port})...")
         self.traffic_manager = self.client.get_trafficmanager(trafficmanager_port)
         self.traffic_manager.set_synchronous_mode(True)
