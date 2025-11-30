@@ -96,9 +96,9 @@ class CarlaYoloRunner(object):
         logging.info("正在加载地图 Town05...")
         self.world = self.client.load_world('Town05')
 
-        tm_port = self.args.tm_port
-        logging.info(f"正在连接到交通管理器 (端口: {tm_port})...")
-        self.traffic_manager = self.client.get_trafficmanager(tm_port)
+        trafficmanager_port = self.args.trafficmanager_port
+        logging.info(f"正在连接到交通管理器 (端口: {trafficmanager_port})...")
+        self.traffic_manager = self.client.get_trafficmanager(trafficmanager_port)
         self.traffic_manager.set_synchronous_mode(True)
 
         settings = self.world.get_settings()
@@ -246,7 +246,7 @@ class CarlaYoloRunner(object):
             
             # 任务 B: 红绿灯检测与颜色识别 (新增)
             visualization.draw_traffic_lights(
-                self.display, self.yolo_font, yolo_results, self.model, img_rgb,
+                self.display, self.yolo_font, yolo_results, self.model, img_rgb, depth_map,
                 detection_method=self.tl_detection_method
             )
 

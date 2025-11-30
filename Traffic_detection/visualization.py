@@ -5,9 +5,9 @@ import carla
 import utils
 import traffic_light  # 引入新模块
 
-def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detection_method='deep_learning'):
+def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, depth_map, detection_method='deep_learning'):
     """
-    专门用于绘制红绿灯及其颜色状态，支持深度学习方法和YOLO直接分类功能
+    专门用于绘制红绿灯及其颜色状态，支持深度学习方法和YOLO直接分类功能，并输出相对位置
     
     Args:
         surface: Pygame显示表面
@@ -15,8 +15,12 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detect
         yolo_results: YOLO检测结果
         yolo_model: YOLO模型对象
         img_rgb: RGB图像数组
+        depth_map: 深度图，用于计算距离
         detection_method: 颜色检测方法，可选 'deep_learning' 或 'hsv'
     """
+    # 获取图像中心，用于计算相对位置
+    img_center_x = surface.get_width() // 2
+    
     # 首先尝试使用YOLO直接分类功能
     tl_results = traffic_light.register_yolo_tl_classification(yolo_results, yolo_model.names)
     
@@ -28,6 +32,9 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detect
         
         # 如果YOLO没有直接给出颜色，使用我们的颜色检测方法
         if color_str == 'UNKNOWN' and detection_method:
+            # 1. 截取红绿灯区域图片
+            roi_rgb = img_rgb[y1:y2, x1:x2]
+            # 2. 识别红绿灯颜色
             color_str, box_color = traffic_light.get_traffic_light_color(
                 img_rgb, [x1, y1, x2, y2], method=detection_method
             )
@@ -37,15 +44,54 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detect
         w = x2 - x1
         h = y2 - y1
         
+        # 计算红绿灯中心位置
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        
+        # 计算相对车辆的位置
+        # 1. 距离计算
+        roi_depth = depth_map[y1:y2, x1:x2]
+        z_values = roi_depth[roi_depth > 0]
+        if len(z_values) > 0:
+            distance = np.median(z_values)
+        else:
+            distance = -1.0
+        
+        # 2. 水平方向相对位置
+        if cx < img_center_x - 100:
+            relative_pos = "Left"
+        elif cx > img_center_x + 100:
+            relative_pos = "Right"
+        else:
+            relative_pos = "Center"
+        
+        # 3. 垂直方向相对位置
+        if cy < surface.get_height() // 3:
+            vertical_pos = "High"
+        elif cy > surface.get_height() * 2 // 3:
+            vertical_pos = "Low"
+        else:
+            vertical_pos = "Middle"
+        
         # 绘制框
         pygame.draw.rect(surface, box_color, pygame.Rect(x1, y1, w, h), 2)
         
-        # 绘制标签
+        # 绘制详细标签
         label = f"TL: {color_str} ({conf:.2f})"
-        text_surface = font.render(label, True, (255, 255, 255), box_color)
+        pos_label = f"Pos: {relative_pos} {vertical_pos}"
+        dist_label = f"Dist: {distance:.1f} m" if distance > 0 else "Dist: Unknown"
         
-        # 稍微向上偏移，避免遮挡车辆标签
+        text_surface = font.render(label, True, (255, 255, 255), box_color)
+        pos_text_surface = font.render(pos_label, True, (255, 255, 255), box_color)
+        dist_text_surface = font.render(dist_label, True, (255, 255, 255), box_color)
+        
+        # 绘制标签，垂直排列
         text_rect = text_surface.get_rect(bottomleft=(x1, y1 - 25)) 
+        pos_text_rect = pos_text_surface.get_rect(bottomleft=(x1, text_rect.top - 5))
+        dist_text_rect = dist_text_surface.get_rect(bottomleft=(x1, pos_text_rect.top - 5))
+        
+        surface.blit(dist_text_surface, dist_text_rect)
+        surface.blit(pos_text_surface, pos_text_rect)
         surface.blit(text_surface, text_rect)
     
     # 遍历剩余的检测结果，确保没有遗漏任何红绿灯
@@ -70,22 +116,63 @@ def draw_traffic_lights(surface, font, yolo_results, yolo_model, img_rgb, detect
             if conf < 0.5: # 简单的置信度过滤
                 continue
             
-            # 2. 调用算法判断颜色
+            # 2. 截取红绿灯区域图片
+            roi_rgb = img_rgb[y1:y2, x1:x2]
+            # 3. 识别红绿灯颜色
             color_str, box_color = traffic_light.get_traffic_light_color(img_rgb, box, method=detection_method)
             
-            # 3. 绘制
+            # 4. 计算相对位置
+            # 计算红绿灯中心位置
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            
+            # 距离计算
+            roi_depth = depth_map[y1:y2, x1:x2]
+            z_values = roi_depth[roi_depth > 0]
+            if len(z_values) > 0:
+                distance = np.median(z_values)
+            else:
+                distance = -1.0
+            
+            # 水平方向相对位置
+            if cx < img_center_x - 100:
+                relative_pos = "Left"
+            elif cx > img_center_x + 100:
+                relative_pos = "Right"
+            else:
+                relative_pos = "Center"
+            
+            # 垂直方向相对位置
+            if cy < surface.get_height() // 3:
+                vertical_pos = "High"
+            elif cy > surface.get_height() * 2 // 3:
+                vertical_pos = "Low"
+            else:
+                vertical_pos = "Middle"
+            
+            # 5. 绘制
             w = x2 - x1
             h = y2 - y1
             
             # 绘制框
             pygame.draw.rect(surface, box_color, pygame.Rect(x1, y1, w, h), 2)
             
-            # 绘制标签
+            # 绘制详细标签
             label = f"TL: {color_str} ({conf:.2f})"
-            text_surface = font.render(label, True, (255, 255, 255), box_color)
+            pos_label = f"Pos: {relative_pos} {vertical_pos}"
+            dist_label = f"Dist: {distance:.1f} m" if distance > 0 else "Dist: Unknown"
             
-            # 稍微向上偏移，避免遮挡车辆标签
+            text_surface = font.render(label, True, (255, 255, 255), box_color)
+            pos_text_surface = font.render(pos_label, True, (255, 255, 255), box_color)
+            dist_text_surface = font.render(dist_label, True, (255, 255, 255), box_color)
+            
+            # 绘制标签，垂直排列
             text_rect = text_surface.get_rect(bottomleft=(x1, y1 - 25)) 
+            pos_text_rect = pos_text_surface.get_rect(bottomleft=(x1, text_rect.top - 5))
+            dist_text_rect = dist_text_surface.get_rect(bottomleft=(x1, pos_text_rect.top - 5))
+            
+            surface.blit(dist_text_surface, dist_text_rect)
+            surface.blit(pos_text_surface, pos_text_rect)
             surface.blit(text_surface, text_rect)
 
 def draw_vehicles_and_truth(
