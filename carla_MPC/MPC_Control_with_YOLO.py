@@ -38,7 +38,7 @@ class MPCCarSimulation:
         # 仿真参数配置
         self.simulation_params = {
             'time_step': 0.05,  # 仿真时间步长（秒）
-            'target_speed': 60,  # 目标速度（km/h）
+            'target_speed': 30,  # 目标速度（km/h）
             'sample_resolution': 2.0,  # 路径规划采样分辨率
             'display_mode': "pygame",  # 显示模式："spec" 或 "pygame"
             'max_simulation_steps': 5000,  # 最大仿真步数
@@ -108,7 +108,6 @@ class MPCCarSimulation:
             print(f"Error checking/loading map: {e}")
 
         # 2. 初始化 Env 类
-        # 注意：Env类内部会再次获取 world，所以这里不需要传递 world 对象
         env = Env(
             host=host,
             port=port,
@@ -190,12 +189,7 @@ class MPCCarSimulation:
         self.agent.plan_route(self.agent._start_transform, self.agent._end_transform)
     
     def _update_pygame_display(self, step, extra_info=None, yolo_data=None):
-        """更新Pygame显示
-        Args:
-            step: 当前步数
-            extra_info: 文本提示信息
-            yolo_data: (img_rgb, tl_results) 元组，包含图像和检测结果
-        """
+        """更新Pygame显示"""
         # 1. 更新 HUD 内容
         self.env.hud.tick(self.env, self.env.clock)
         
@@ -203,26 +197,18 @@ class MPCCarSimulation:
         if step == 0:
             self.env.display.fill((0, 0, 0))
         
-        # 3. 渲染 HUD (这会绘制主摄像头背景和左侧文字信息)
-        # 注意：self.env.hud.render 内部并未绘制 camera 图像，
-        # camera 图像是由 env.py 中的 camera_callback 异步 blit 到 self.env.display 的。
-        # 这里我们假设主画面已经由回调函数更新了。
+        # 3. 渲染 HUD
         self.env.hud.render(self.env.display)
         
         # 4. 绘制 YOLO 检测视角 (画中画)
         if yolo_data:
             img_rgb, tl_results = yolo_data
             if img_rgb is not None:
-                # 在图像上绘制检测框
-                # img_rgb 是 RGB 格式, cv2 默认是 BGR, 但我们这里只用来绘图，
-                # pygame 需要 RGB，所以我们直接用 RGB 画，颜色参数传 RGB 即可。
-                
                 for bbox, info in tl_results.items():
                     x1, y1, x2, y2 = bbox
                     color_name = info['color']
                     conf = info.get('conf', 0.0)
                     
-                    # 定义绘制颜色 (RGB)
                     if color_name == 'RED':
                         box_color = (255, 0, 0)
                     elif color_name == 'YELLOW':
@@ -230,41 +216,40 @@ class MPCCarSimulation:
                     elif color_name == 'GREEN':
                         box_color = (0, 255, 0)
                     else:
-                        box_color = (200, 200, 200) # 未知/灰色
+                        box_color = (200, 200, 200)
                     
-                    # 画框
-                    cv2.rectangle(img_rgb, (x1, y1), (x2, y2), box_color, 2)
-                    # 画标签
-                    label = f"{color_name} {conf:.2f}"
+                    # 检查是否在有效区域内（可视化用）
+                    img_w = img_rgb.shape[1]
+                    center_x = (x1 + x2) / 2
+                    is_in_roi = (img_w * 0.25 < center_x < img_w * 0.75)
+                    
+                    thickness = 2 if is_in_roi else 1
+                    line_type = cv2.LINE_AA if is_in_roi else cv2.LINE_4
+                    
+                    cv2.rectangle(img_rgb, (x1, y1), (x2, y2), box_color, thickness, line_type)
+                    
+                    status_text = "" if is_in_roi else "(IGNORED)"
+                    label = f"{color_name} {conf:.2f} {status_text}"
                     cv2.putText(img_rgb, label, (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1)
+                
+                # 绘制 ROI 辅助线
+                img_h, img_w, _ = img_rgb.shape
+                cv2.line(img_rgb, (int(img_w * 0.25), 0), (int(img_w * 0.25), img_h), (255, 255, 255), 1)
+                cv2.line(img_rgb, (int(img_w * 0.75), 0), (int(img_w * 0.75), img_h), (255, 255, 255), 1)
 
-                # 将 numpy 数组转换为 pygame surface
-                # img_rgb shape: (480, 640, 3) -> (Width, Height) for Pygame
-                # Pygame make_surface 需要 (Width, Height, Depth), numpy 是 (Row, Col, Depth) 即 (H, W, D)
-                # 所以需要 swapaxes
                 yolo_surface = pygame.surfarray.make_surface(img_rgb.swapaxes(0, 1))
-                
-                # 绘制到主屏幕右上角
-                # 主屏幕默认 1280x720, YOLO 640x480
-                # 放置位置: x = 1280 - 640 = 640, y = 0
                 self.env.display.blit(yolo_surface, (640, 0))
-                
-                # 画一个边框区分两个视图
                 pygame.draw.rect(self.env.display, (255, 255, 255), (640, 0, 640, 480), 2)
         
-        # 5. 显示额外的警告文字 (如红灯停车)
+        # 5. 显示警告文字
         if extra_info:
             font = pygame.font.SysFont("Arial", 30, bold=True)
-            text_surface = font.render(extra_info, True, (255, 0, 0)) # 红色字体
-            # 显示在屏幕中央偏下位置
+            text_surface = font.render(extra_info, True, (255, 0, 0))
             text_rect = text_surface.get_rect(center=(640, 500))
             self.env.display.blit(text_surface, text_rect)
 
-        # 6. 刷新屏幕
         pygame.display.flip()
-        
-        # 7. 检查退出
         self.env.check_quit()
     
     def _check_destination_reached(self, next_state):
@@ -288,7 +273,6 @@ class MPCCarSimulation:
     
     def _visualize_results(self):
         """可视化仿真结果"""
-        # 将列表转换为numpy数组
         if not self.simulation_data['times']:
             return
 
@@ -298,10 +282,8 @@ class MPCCarSimulation:
         steerings = np.array(self.simulation_data['steerings'])
         times = np.array(self.simulation_data['times'])
         
-        # 创建2x2子图
         fig, axs = plt.subplots(2, 2, figsize=(12, 8))
         
-        # 1. 车辆轨迹和规划路径
         axs[0, 0].plot(trajectory[:, 0], trajectory[:, 1], 
                       label="Vehicle Path", color='darkorange', linewidth=2)
         axs[0, 0].scatter(self.agent._start_transform.location.x, 
@@ -311,7 +293,6 @@ class MPCCarSimulation:
                          self.agent._end_transform.location.y, 
                          color='red', label="End", zorder=5)
         
-        # 绘制规划路径
         if self.route:
             route_points = np.array([[wp.transform.location.x, wp.transform.location.y] 
                                     for wp, _ in self.route])
@@ -324,16 +305,13 @@ class MPCCarSimulation:
         axs[0, 0].legend(loc='upper left', fontsize=10)
         axs[0, 0].grid(True)
         
-        # 2. 速度-时间曲线
         axs[0, 1].plot(times, velocities, 
                       label="Velocity (m/s)", color='royalblue', linewidth=2)
         axs[0, 1].set_title("Velocity over Time", fontsize=14)
-        axs[0, 1].set_xlabel("Time (s)", fontsize=12)
         axs[0, 1].set_ylabel("Velocity (m/s)", fontsize=12)
         axs[0, 1].legend(loc='upper right', fontsize=10)
         axs[0, 1].grid(True)
         
-        # 3. 加速度-时间曲线
         axs[1, 0].plot(times, accelerations, 
                       label="Acceleration (m/s²)", color='orange', linewidth=2)
         axs[1, 0].set_title("Acceleration over Time", fontsize=14)
@@ -342,7 +320,6 @@ class MPCCarSimulation:
         axs[1, 0].legend(loc='upper right', fontsize=10)
         axs[1, 0].grid(True)
         
-        # 4. 转向角-时间曲线
         axs[1, 1].plot(times, steerings, 
                       label="Steering Angle (rad)", color='green', linewidth=2)
         axs[1, 1].set_title("Steering Angle over Time", fontsize=14)
@@ -362,34 +339,21 @@ class MPCCarSimulation:
         tl_results = {}
         
         if self.yolo_model:
-            # --- 修改开始：清空队列，只取最后一帧 ---
+            # 清空队列，只取最新一帧
             image_data = None
-            # 循环读取队列，丢弃旧帧，直到取到最新的一帧
             while not self.rgb_queue.empty():
                 image_data = self.rgb_queue.get_nowait()
             
-            # 如果队列原本就是空的（可能是仿真刚开始），则没有数据处理
             if image_data is None:
                 return is_red_light, info_text, img_rgb, tl_results
-            # --- 修改结束 ---
 
             try:
-                # 后续处理逻辑保持不变
                 array = np.frombuffer(image_data.raw_data, dtype=np.dtype("uint8"))
                 array = np.reshape(array, (image_data.height, image_data.width, 4))
-                
-                # 转换为 RGB
                 img_rgb = array[:, :, :3][:, :, ::-1].copy()
                 
-                # ... (其余 YOLO 推理和红绿灯检测代码保持不变) ...
-                # array[:, :, :3] 取出 BGR, ::-1 转换为 RGB
-                img_rgb = array[:, :, :3][:, :, ::-1].copy()
-                
-                # YOLO 推理
                 results = self.yolo_model(img_rgb, verbose=False)
                 
-                # 调用 traffic_light 模块进行检测和颜色分析
-                # 使用 deep_learning 方法进行二次确认
                 tl_results = traffic_light.detect_traffic_lights(
                     img_rgb, 
                     results, 
@@ -397,19 +361,25 @@ class MPCCarSimulation:
                     method='hsv'
                 )
                 
-                # 分析检测结果
+                img_w = img_rgb.shape[1]
+                
                 for bbox, info in tl_results.items():
                     color = info['color']
                     
-                    # 简单的过滤逻辑：如果是红灯，且边界框足够大（意味着距离较近）
                     if color == 'RED':
-                        # bbox格式: (x1, y1, x2, y2)
-                        height = bbox[3] - bbox[1]
-                        # 高度阈值，用于忽略远处的红灯，根据实际分辨率(640x480)调整
+                        x1, y1, x2, y2 = bbox
+                        center_x = (x1 + x2) / 2
+                        height = y2 - y1
+                        
+                        # ROI 区域过滤
+                        if center_x < img_w * 0.25 or center_x > img_w * 0.75:
+                            print(f"Ignoring RED light at x={center_x:.1f} (outside ROI)")
+                            continue
+                        
                         if height > 20: 
                             is_red_light = True
                             info_text = "RED LIGHT! STOP!"
-                            print(f"Red light detected! Box height: {height}")
+                            print(f"Red light detected! Box height: {height}, Center X: {center_x:.1f}")
                             break
                             
             except queue.Empty:
@@ -418,53 +388,53 @@ class MPCCarSimulation:
                 print(f"YOLO processing error: {e}")
                 
         return is_red_light, info_text, img_rgb, tl_results
+
+    def _is_vehicle_in_junction(self):
+        """检查车辆是否位于路口内部"""
+        if self.env.ego_vehicle and self.env.map:
+            loc = self.env.ego_vehicle.get_location()
+            # 获取当前位置的 Waypoint，并检查 is_junction 属性
+            waypoint = self.env.map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            return waypoint.is_junction
+        return False
     
-    def run_simulation(self, start_idx=60, end_idx=40):
+    def run_simulation(self, start_idx=75, end_idx=40):
         """运行完整的仿真流程"""
         try:
-            # 设置路径
             self._setup_route(start_idx, end_idx)
-            
-            # 初始化车辆和智能体
             self._initialize_vehicle_and_agent(start_idx, end_idx)
             
-            # 初始化Pygame显示（如果需要）
             if self.env.display_method == "pygame":
                 self.env.init_display()
             
-            # 初始化 YOLO 传感器
             self._setup_yolo_sensor()
             
-            # 主仿真循环
             for step in range(self.simulation_params['max_simulation_steps']):
                 try:
                     # 1. 运行 YOLO 检测
                     is_red_light, tl_info, img_rgb, tl_results = self._process_yolo_detection()
 
                     # 2. 执行 MPC 控制
-                    # 首先获取 MPC 建议的控制量
                     acceleration_opt, steering_opt, next_state = self.agent.run_step()
                     
                     # 3. 红绿灯停车逻辑覆盖
-                    if is_red_light:
-                        acceleration_opt = -4.0  # 强制最大刹车
-                        # 保持 MPC 计算的转向，确保车辆在车道内
+                    # 增加判断：只有在检测到红灯 且 车辆 *不在* 路口内部时 才停车
+                    if is_red_light and not self._is_vehicle_in_junction():
+                        acceleration_opt = -4.0
+                        # 如果在路口内检测到红灯，可能是侧向的，或者是驶出方向的，不应停车
+                        if is_red_light:
+                            tl_info = "RED LIGHT "
                     
-                    # 记录仿真数据
                     self._record_simulation_data(
                         step, next_state, acceleration_opt, steering_opt
                     )
                     
-                    # 执行环境步进
                     self.env.step([acceleration_opt, steering_opt])
                     
-                    # 更新Pygame显示
                     if self.env.display_method == "pygame":
-                        # 将 YOLO 图像和结果传递给显示函数
                         yolo_data = (img_rgb, tl_results) if img_rgb is not None else None
                         self._update_pygame_display(step, extra_info=tl_info, yolo_data=yolo_data)
                     
-                    # 检查是否到达目的地
                     if self._check_destination_reached(next_state):
                         print("Destination reached!")
                         if self.env.display_method == "pygame":
@@ -473,8 +443,6 @@ class MPCCarSimulation:
                     
                 except Exception as e:
                     print(f"Simulation step error: {e}")
-                    import traceback
-                    traceback.print_exc()
                     continue
             
         except KeyboardInterrupt:
@@ -482,16 +450,11 @@ class MPCCarSimulation:
         except Exception as e:
             print(f"Critical simulation error: {e}")
         finally:
-            # 可视化结果
             self._visualize_results()
 
 
 def main():
-    """主函数"""
-    # 创建仿真实例
     simulation = MPCCarSimulation()
-    
-    # 运行仿真
     simulation.run_simulation()
 
 
