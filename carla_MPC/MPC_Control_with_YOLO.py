@@ -37,12 +37,13 @@ class MPCCarSimulation:
         """初始化仿真参数和环境"""
         # 仿真参数配置
         self.simulation_params = {
-            'time_step': 0.05,  # 仿真时间步长（秒）
-            'target_speed': 30,  # 目标速度（km/h）
+            'time_step': 0.05,         # 仿真时间步长（秒）
+            'target_speed': 30,        # 目标速度（km/h）
             'sample_resolution': 2.0,  # 路径规划采样分辨率
             'display_mode': "pygame",  # 显示模式："spec" 或 "pygame"
-            'max_simulation_steps': 5000,  # 最大仿真步数
-            'destination_threshold': 1.0  # 到达目的地的距离阈值（米）
+            'max_simulation_steps': 5000, # 最大仿真步数
+            'destination_threshold': 1.0, # 到达目的地的距离阈值（米）
+            'map_name': "Town03"       # 地图名称配置 (例如: Town03, Town05, Town10HD)
         }
         
         # 初始化环境
@@ -85,11 +86,12 @@ class MPCCarSimulation:
             self.yolo_model = None
 
     def _initialize_environment(self):
-        """初始化仿真环境，并确保加载 Town05 地图"""
+        """初始化仿真环境，并根据配置加载地图"""
         host = 'localhost'
         port = 2000
+        target_map = self.simulation_params['map_name']
         
-        # 1. 检查并加载 Town05
+        # 1. 检查并加载指定的地图
         try:
             client = carla.Client(host, port)
             client.set_timeout(10.0)
@@ -97,12 +99,13 @@ class MPCCarSimulation:
             current_map_name = world.get_map().name
             
             # CARLA 地图名称通常包含路径，如 "/Game/Carla/Maps/Town05"
-            if 'Town05' not in current_map_name:
-                print(f"Current map is {current_map_name}. Loading Town05...")
-                client.load_world('Town05')
-                print("Town05 loaded successfully.")
+            # 只要当前地图名称中包含目标地图名，就不重新加载
+            if target_map not in current_map_name:
+                print(f"Current map is {current_map_name}. Loading {target_map}...")
+                client.load_world(target_map)
+                print(f"{target_map} loaded successfully.")
             else:
-                print("Town05 is already loaded.")
+                print(f"{target_map} is already loaded.")
                 
         except Exception as e:
             print(f"Error checking/loading map: {e}")
@@ -373,13 +376,11 @@ class MPCCarSimulation:
                         
                         # ROI 区域过滤
                         if center_x < img_w * 0.25 or center_x > img_w * 0.75:
-                            print(f"Ignoring RED light at x={center_x:.1f} (outside ROI)")
                             continue
                         
                         if height > 20: 
                             is_red_light = True
                             info_text = "RED LIGHT! STOP!"
-                            print(f"Red light detected! Box height: {height}, Center X: {center_x:.1f}")
                             break
                             
             except queue.Empty:
@@ -423,7 +424,7 @@ class MPCCarSimulation:
                         acceleration_opt = -4.0
                         # 如果在路口内检测到红灯，可能是侧向的，或者是驶出方向的，不应停车
                         if is_red_light:
-                            tl_info = "RED LIGHT "
+                            tl_info = "RED LIGHT! STOP!"
                     
                     self._record_simulation_data(
                         step, next_state, acceleration_opt, steering_opt
