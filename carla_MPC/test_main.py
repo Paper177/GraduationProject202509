@@ -21,7 +21,7 @@ env = Env(display_method=display_mode, dt=simu_step)
 env.clean()
 spawn_points = env.map.get_spawn_points()
 
-start_idx, end_idx = 87, 70  # Indices for start and end points
+start_idx, end_idx = 87, 40  # Indices for start and end points
 
 grp = GlobalRoutePlanner(env.map, sample_res)
 
