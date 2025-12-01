@@ -31,7 +31,7 @@ YOLO_MODEL_PATH = r"E:\GraduationProject202509\YoloModel\yolo11x.pt"
 YOLO_TARGET_CLASSES = ['traffic light']
 
 # 安全策略参数
-SAFE_DIST_TRAFFIC_LIGHT = 15.0  # 红绿灯停车距离 (米)
+SAFE_DIST_TRAFFIC_LIGHT = 30.0  # 红绿灯停车距离 (米)
 STOP_DISTANCE = 5.0             # 距离停止线多少米时速度降为0
 
 # 深度图处理函数
@@ -76,10 +76,23 @@ for wp,_ in route:
 # 加载YOLO模型
 print("Loading YOLO model...")
 try:
-    yolo_model = YOLO(YOLO_MODEL_PATH)
+    # 检查模型路径是否存在本地文件
+    import os
+    if os.path.exists(YOLO_MODEL_PATH):
+        print(f"从本地文件加载模型: {YOLO_MODEL_PATH}")
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+    else:
+        print(f"尝试从网络下载模型: {YOLO_MODEL_PATH}")
+        # 尝试下载模型
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+    
     print("YOLO model loaded successfully.")
 except Exception as e:
-    print(f"Error loading YOLO model: {e}")
+    print(f"加载 YOLO 模型失败: {e}")
+    # 提供更具体的错误信息和建议
+    if 'urlopen error' in str(e) or 'timeout' in str(e).lower():
+        print("模型下载失败，可能是网络连接问题。请确保您已连接到互联网，或提前下载模型文件并放置在指定路径。")
+    print("请检查模型路径是否正确，或尝试使用本地已下载的模型文件。")
     yolo_model = None
 
 # 设置传感器 (RGB + Depth)
@@ -89,7 +102,7 @@ blueprint_library = env.world.get_blueprint_library()
 cam_bp = blueprint_library.find('sensor.camera.rgb')
 cam_bp.set_attribute('image_size_x', '1280')
 cam_bp.set_attribute('image_size_y', '720')
-cam_bp.set_attribute('fov', '90')
+cam_bp.set_attribute('fov', '30')  # 减小fov以延长检测距离，与Traffic_detection/simulation.py保持一致
 cam_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
 camera_rgb = env.world.spawn_actor(cam_bp, cam_transform, attach_to=env.ego_vehicle)
 
@@ -97,7 +110,7 @@ camera_rgb = env.world.spawn_actor(cam_bp, cam_transform, attach_to=env.ego_vehi
 depth_bp = blueprint_library.find('sensor.camera.depth')
 depth_bp.set_attribute('image_size_x', '1280')
 depth_bp.set_attribute('image_size_y', '720')
-depth_bp.set_attribute('fov', '90')
+depth_bp.set_attribute('fov', '30')  # 减小fov以延长检测距离，与RGB相机和Traffic_detection/simulation.py保持一致
 camera_depth = env.world.spawn_actor(depth_bp, cam_transform, attach_to=env.ego_vehicle)
 
 # 传感器队列

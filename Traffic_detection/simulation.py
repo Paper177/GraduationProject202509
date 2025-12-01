@@ -75,17 +75,118 @@ class CarlaYoloRunner(object):
         self.clock = pygame.time.Clock()
         self.yolo_font = pygame.font.SysFont("Arial", 16)
 
+    # 1. 修改 _load_yolo_model 方法
     def _load_yolo_model(self):
         """加载 YOLOv11 模型"""
         logging.info(f"正在从 {self.args.yolo_model} 加载 YOLO11 模型...")
         try:
-            self.model = YOLO(self.args.yolo_model)
+            # 检查模型路径是否存在本地文件
+            import os
+            if os.path.exists(self.args.yolo_model):
+                logging.info(f"从本地文件加载模型: {self.args.yolo_model}")
+                self.model = YOLO(self.args.yolo_model)
+            else:
+                logging.info(f"尝试从网络下载模型: {self.args.yolo_model}")
+                # 尝试下载模型
+                self.model = YOLO(self.args.yolo_model)
+            
             logging.info(f"YOLO11 模型加载成功。")
             logging.info(f"目标车辆类别: {utils.YOLO_TARGET_CLASSES}")
             logging.info(f"目标交通设施: {traffic_light.YOLO_TARGET_CLASS}")
+            return True
         except Exception as e:
             logging.error(f"加载 YOLO 模型失败: {e}")
-            raise
+            # 提供更具体的错误信息和建议
+            if 'urlopen error' in str(e) or 'timeout' in str(e).lower():
+                logging.error("模型下载失败，可能是网络连接问题。请确保您已连接到互联网，或提前下载模型文件并放置在指定路径。")
+            logging.error("请检查模型路径是否正确，或尝试使用本地已下载的模型文件。")
+            self.model = None
+            return False
+    
+    # 2. 修改 run 方法，检查模型加载是否成功
+    def run(self):
+        try:
+            self._init_pygame()
+            # 检查模型加载是否成功
+            if not self._load_yolo_model():
+                logging.critical("模型加载失败，程序无法继续执行。")
+                return
+            self._setup_carla()
+            self._spawn_actors()
+            self.world.tick()
+            self._game_loop()
+        except KeyboardInterrupt:
+            logging.info("用户中断...正在退出。")
+        except Exception as e:
+            logging.error(f"发生错误: {e}", exc_info=True)
+        finally:
+            self.cleanup()
+    
+    # 3. 修改 _game_loop 方法，添加模型可用性检查
+    def _game_loop(self):
+        """核心游戏循环"""
+        logging.info("开始 YOLOv11 多任务检测 (车辆 + 红绿灯)...")
+        while self.run_simulation:
+            # 检查模型是否可用
+            if self.model is None:
+                logging.critical("模型不可用，程序退出。")
+                self.run_simulation = False
+                continue
+                
+            self._process_events()
+            self.world.tick()
+    
+            try:
+                image_rgb = self.rgb_queue.get(timeout=1.0)
+                image_depth = self.depth_queue.get(timeout=1.0)
+                inst_seg_image = self.inst_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+                
+            # --- 1. 图像预处理 ---
+            img_bgra_rgb = np.reshape(np.copy(image_rgb.raw_data), (self.height, self.width, 4))
+            img_rgb = utils.draw_carla_image(self.display, img_bgra_rgb)
+            depth_map = utils.process_depth_image(image_depth)
+            
+            inst_seg_bgra = np.reshape(np.copy(inst_seg_image.raw_data), (self.height, self.width, 4))
+            _, actor_ids_map = utils.decode_instance_segmentation(inst_seg_bgra)
+            
+            # --- 2. YOLO 统一检测 ---
+            # 同时检测车辆和红绿灯
+            try:
+                yolo_results = self.model.track(img_rgb, persist=True, verbose=False)
+                if yolo_results:
+                    self.last_inference_time = yolo_results[0].speed.get('inference', 0.0)
+            except Exception as e:
+                logging.error(f"YOLO 推理出错: {e}")
+                yolo_results = None
+            
+            # 投影矩阵 (用于 3D 框绘制)
+            world_2_camera = np.array(self.camera_rgb.get_transform().get_inverse_matrix())
+            K = utils.build_projection_matrix(self.width, self.height, self.camera_bp_rgb.get_attribute("fov").as_float())
+            
+            # --- 3. 任务分发与绘制 ---
+            if yolo_results is not None:
+                # 任务 A: 车辆检测与测速 (使用 visualization 中的新函数名)
+                visualization.draw_vehicles_and_truth(
+                    self.display, self.yolo_font, yolo_results, self.model,
+                    depth_map, actor_ids_map, self.world, self.ego_vehicle, 
+                    self.camera_bp_rgb, self.camera_rgb, K, world_2_camera,
+                    self.vehicle_tracker
+                )
+                
+                # 任务 B: 红绿灯检测与颜色识别 (新增)
+                visualization.draw_traffic_lights(
+                    self.display, self.yolo_font, yolo_results, self.model, img_rgb, depth_map,
+                    detection_method=self.tl_detection_method
+                )
+    
+            # --- 4. 绘制帧率 ---
+            time_text = f"Inference: {self.last_inference_time:.1f} ms"
+            self.display.blit(self.yolo_font.render(time_text, True, (255, 255, 0)), (10, 10))
+            
+            pygame.display.flip()
+            self.clock.tick(20)
 
     def _setup_carla(self):
         """连接 CARLA 并设置世界"""
@@ -133,7 +234,8 @@ class CarlaYoloRunner(object):
         self.actors_to_destroy.append(self.ego_vehicle)
 
         # 2. 生成传感器
-        fov = 70.0
+        # 减小fov值以获得更大的焦段和更远的检测距离（默认70.0，改为45.0获得更远检测）
+        fov = 30.0
         camera_init_trans = carla.Transform(carla.Location(x=1.2, z=2.0))
         
         # RGB
@@ -201,76 +303,6 @@ class CarlaYoloRunner(object):
                 self.run_simulation = False
             elif event.type == pygame.KEYUP and event.key == K_ESCAPE:
                 self.run_simulation = False
-
-    def _game_loop(self):
-        """核心游戏循环"""
-        logging.info("开始 YOLOv11 多任务检测 (车辆 + 红绿灯)...")
-        while self.run_simulation:
-            self._process_events()
-            self.world.tick()
-
-            try:
-                image_rgb = self.rgb_queue.get(timeout=1.0)
-                image_depth = self.depth_queue.get(timeout=1.0)
-                inst_seg_image = self.inst_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-                
-            # --- 1. 图像预处理 ---
-            img_bgra_rgb = np.reshape(np.copy(image_rgb.raw_data), (self.height, self.width, 4))
-            img_rgb = utils.draw_carla_image(self.display, img_bgra_rgb)
-            depth_map = utils.process_depth_image(image_depth)
-            
-            inst_seg_bgra = np.reshape(np.copy(inst_seg_image.raw_data), (self.height, self.width, 4))
-            _, actor_ids_map = utils.decode_instance_segmentation(inst_seg_bgra)
-            
-            # --- 2. YOLO 统一检测 ---
-            # 同时检测车辆和红绿灯
-            yolo_results = self.model.track(img_rgb, persist=True, verbose=False)
-            if yolo_results:
-                self.last_inference_time = yolo_results[0].speed.get('inference', 0.0)
-            
-            # 投影矩阵 (用于 3D 框绘制)
-            world_2_camera = np.array(self.camera_rgb.get_transform().get_inverse_matrix())
-            K = utils.build_projection_matrix(self.width, self.height, self.camera_bp_rgb.get_attribute("fov").as_float())
-            
-            # --- 3. 任务分发与绘制 ---
-            
-            # 任务 A: 车辆检测与测速 (使用 visualization 中的新函数名)
-            visualization.draw_vehicles_and_truth(
-                self.display, self.yolo_font, yolo_results, self.model,
-                depth_map, actor_ids_map, self.world, self.ego_vehicle, 
-                self.camera_bp_rgb, self.camera_rgb, K, world_2_camera,
-                self.vehicle_tracker
-            )
-            
-            # 任务 B: 红绿灯检测与颜色识别 (新增)
-            visualization.draw_traffic_lights(
-                self.display, self.yolo_font, yolo_results, self.model, img_rgb, depth_map,
-                detection_method=self.tl_detection_method
-            )
-
-            # --- 4. 绘制帧率 ---
-            time_text = f"Inference: {self.last_inference_time:.1f} ms"
-            self.display.blit(self.yolo_font.render(time_text, True, (255, 255, 0)), (10, 10))
-            
-            pygame.display.flip()
-            self.clock.tick(20)
-
-    def run(self):
-        try:
-            self._init_pygame()
-            self._load_yolo_model()
-            self._setup_carla()
-            self._spawn_actors()
-            self.world.tick()
-            self._game_loop()
-        except KeyboardInterrupt:
-            logging.info("用户中断...正在退出。")
-        except Exception as e:
-            logging.error(f"发生错误: {e}", exc_info=True)
-        finally:
-            self.cleanup()
 
     def cleanup(self):
         logging.info("正在清理资源...")
