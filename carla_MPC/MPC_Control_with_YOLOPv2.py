@@ -1,0 +1,485 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from src.mcp_controller import Vehicle
+from env import Env, draw_waypoints
+
+import sys
+import pathlib
+import queue
+import cv2
+import os
+
+# --- 路径配置 ---
+# 1. 添加 Traffic_detection 模块路径
+traffic_detection_path = pathlib.Path(__file__).parent.parent / 'Traffic_detection'
+sys.path.insert(0, str(traffic_detection_path))
+sys.path.insert(0, str(pathlib.Path(__file__).with_name('src')))
+
+# 2. 添加 YOLOPv2 项目路径 (假设在 carla_MPC 上级目录)
+yolopv2_path = pathlib.Path(__file__).parent.parent / 'YOLOPv2'
+if yolopv2_path.exists():
+    sys.path.insert(0, str(yolopv2_path))
+
+# --- 导入依赖 ---
+try:
+    from ultralytics import YOLO
+    import traffic_light
+    YOLO_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: YOLO or traffic_light module not found. {e}")
+    YOLO_AVAILABLE = False
+
+try:
+    import torch
+    import torchvision.transforms as transforms
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    print("Warning: PyTorch/Torchvision not found. YOLOPv2 will be disabled.")
+    TORCH_AVAILABLE = False
+
+from src.x_v2x_agent import Xagent
+from src.global_route_planner import GlobalRoutePlanner
+
+import time
+import pygame
+import carla
+
+# --- YOLOPv2 检测类 ---
+class YOLOPv2Detector:
+    def __init__(self):
+        self.model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.transform = None
+        
+        if not TORCH_AVAILABLE:
+            return
+
+        # 定位本地 YOLOPv2 仓库
+        self.repo_path = pathlib.Path('carla_MPC/YOLOPv2')
+        
+        try:
+            print("Loading YOLOPv2 model...")
+            if self.repo_path.exists():
+                print(f"Found local YOLOPv2 at {self.repo_path}")
+                # 使用 torch.hub 加载本地仓库
+                # source='local' 会读取仓库中的 hubconf.py
+                # trust_repo=True (对于较新版本的 torch)
+                try:
+                    self.model = torch.hub.load(str(self.repo_path), 'yolopv2', source='local', pretrained=True)
+                except TypeError:
+                    # 旧版本 torch 可能不支持 trust_repo
+                    self.model = torch.hub.load(str(self.repo_path), 'yolopv2', source='local', pretrained=True)
+            else:
+                print("Local YOLOPv2 not found, attempting to download from CAIC-AD/YOLOPv2...")
+                self.model = torch.hub.load('CAIC-AD/YOLOPv2', 'yolopv2', pretrained=True)
+            
+            self.model.to(self.device)
+            self.model.eval()
+            print("YOLOPv2 loaded successfully.")
+            
+            # YOLOPv2 预处理 (标准化参数与 ImageNet 一致)
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                )
+            ])
+            
+        except Exception as e:
+            print(f"Failed to load YOLOPv2: {e}")
+            import traceback
+            traceback.print_exc()
+            self.model = None
+
+    def infer(self, img_rgb):
+        """
+        执行 YOLOPv2 推理
+        Args:
+            img_rgb: 原始 RGB 图像 (numpy array)
+        Returns:
+            img_vis: 叠加了车道线和可行驶区域的图像
+        """
+        if self.model is None:
+            return img_rgb
+
+        img_h, img_w = img_rgb.shape[:2]
+        
+        # 1. 预处理
+        # YOLOPv2 推荐输入尺寸为 640x640
+        img_resized = cv2.resize(img_rgb, (640, 640))
+        input_tensor = self.transform(img_resized).unsqueeze(0).to(self.device)
+        
+        # 2. 推理
+        with torch.no_grad():
+            # YOLOPv2 forward 返回: (det_out, da_seg_out, ll_seg_out)
+            # det_out: [tensor, tensor, tensor] (不同尺度的检测头输出)
+            # da_seg_out: Drivable Area Segmentation
+            # ll_seg_out: Lane Line Segmentation
+            det_out, da_seg_out, ll_seg_out = self.model(input_tensor)
+            
+        # 3. 后处理 - 分割掩码
+        # 插值回原始图像大小 (或者先插值回 640x640 再 resize，这里直接插值回原图大小以提高效率)
+        
+        # Drivable Area (可行驶区域)
+        da_seg_out = F.interpolate(da_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
+        da_seg_mask = torch.argmax(da_seg_out, dim=1).squeeze().cpu().numpy() # 0: 背景, 1: 区域
+        
+        # Lane Line (车道线)
+        ll_seg_out = F.interpolate(ll_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
+        ll_seg_mask = torch.argmax(ll_seg_out, dim=1).squeeze().cpu().numpy() # 0: 背景, 1: 车道线
+        
+        # 4. 可视化叠加
+        img_vis = img_rgb.copy()
+        
+        # 绘制可行驶区域 (绿色，半透明)
+        # YOLOP 论文通常用绿色表示 drivable area
+        color_area = np.zeros_like(img_vis)
+        color_area[da_seg_mask == 1] = [0, 255, 0] # Green
+        
+        mask_bool = (da_seg_mask == 1)
+        # alpha blending: 0.7 原图 + 0.3 颜色
+        if mask_bool.any():
+            img_vis[mask_bool] = cv2.addWeighted(img_vis[mask_bool], 0.7, color_area[mask_bool], 0.3, 0).squeeze()
+        
+        # 绘制车道线 (红色，高亮)
+        # YOLOP 论文通常用红色/蓝色表示 lane line
+        # 对掩码进行膨胀处理，使线条更明显
+        ll_mask_uint8 = (ll_seg_mask).astype(np.uint8)
+        # kernel = np.ones((3,3), np.uint8)
+        # ll_mask_uint8 = cv2.dilate(ll_mask_uint8, kernel, iterations=1)
+        
+        img_vis[ll_mask_uint8 == 1] = [255, 0, 0] # Red
+        
+        return img_vis
+
+# --- 辅助函数：停止线检测 (OpenCV) ---
+# YOLOPv2 不专门检测路口停止线，因此保留 OpenCV 逻辑作为补充
+def detect_stop_lines(img_rgb):
+    """检测路口停止线 (OpenCV)"""
+    height, width = img_rgb.shape[:2]
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    
+    mask = np.zeros_like(edges)
+    # 梯形 ROI，关注车前地面
+    polygons = np.array([[
+        (0, height), (width, height),
+        (int(width * 0.7), int(height * 0.6)),
+        (int(width * 0.3), int(height * 0.6))
+    ]])
+    cv2.fillPoly(mask, polygons, 255)
+    masked_edges = cv2.bitwise_and(edges, mask)
+    
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 30, minLineLength=30, maxLineGap=20)
+    stop_line_detected = False
+    
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 - x1 == 0: slope = 999.0
+            else: slope = (y2 - y1) / (x2 - x1)
+            
+            # 停止线判定：水平 (斜率接近0) 且位于画面下方
+            if abs(slope) < 0.1 and min(y1, y2) > height * 0.65:
+                stop_line_detected = True
+                break
+    return stop_line_detected
+
+
+class MPCCarSimulation:
+    """MPC车辆控制仿真主类 (集成 YOLOPv2 车道/路面检测 + YOLOv11 红绿灯检测)"""
+    
+    def __init__(self):
+        """初始化仿真参数和环境"""
+        # 仿真参数配置
+        self.simulation_params = {
+            'time_step': 0.05,         # 仿真时间步长（秒）
+            'target_speed': 30,        # 目标速度（km/h）
+            'sample_resolution': 2.0,  # 路径规划采样分辨率
+            'display_mode': "pygame",  # 显示模式
+            'max_simulation_steps': 5000, 
+            'destination_threshold': 1.0, 
+            'map_name': "Town03"       
+        }
+        
+        # 初始化环境
+        self.env = self._initialize_environment()
+        self.spawn_points = self.env.map.get_spawn_points()
+        
+        # 仿真数据记录
+        self.simulation_data = {
+            'trajectory': [], 'velocities': [], 'accelerations': [], 'steerings': [], 'times': []
+        }
+        
+        # 车辆和控制器
+        self.vehicle = None
+        self.agent = None
+        self.route = None
+        
+        # AI 模型相关
+        self.yolo_model = None      # YOLOv11 (用于红绿灯)
+        self.yolopv2_detector = None # YOLOPv2 (用于车道线/路面)
+        self.rgb_queue = queue.Queue()
+        self.yolo_sensor = None
+        
+        self._init_models()
+
+    def _init_models(self):
+        """初始化所有 AI 模型"""
+        # 1. Init YOLOv11 (Traffic Lights)
+        if YOLO_AVAILABLE:
+            model_path = pathlib.Path("YoloModel/yolo11x.pt")
+            try:
+                print(f"Loading YOLOv11 model from {model_path}...")
+                self.yolo_model = YOLO(str(model_path)) if model_path.exists() else YOLO("yolo11s.pt")
+                print("YOLOv11 model loaded.")
+            except Exception as e:
+                print(f"Failed to load YOLOv11: {e}")
+        
+        # 2. Init YOLOPv2 (Lane & Drivable Area)
+        if TORCH_AVAILABLE:
+            self.yolopv2_detector = YOLOPv2Detector()
+
+    def _initialize_environment(self):
+        """初始化仿真环境"""
+        host = 'localhost'
+        port = 2000
+        target_map = self.simulation_params['map_name']
+        
+        try:
+            client = carla.Client(host, port)
+            client.set_timeout(10.0)
+            world = client.get_world()
+            current_map_name = world.get_map().name
+            
+            if target_map not in current_map_name:
+                print(f"Loading {target_map}...")
+                client.load_world(target_map)
+            else:
+                print(f"{target_map} is already loaded.")
+                
+        except Exception as e:
+            print(f"Error checking/loading map: {e}")
+
+        env = Env(
+            host=host,
+            port=port,
+            display_method=self.simulation_params['display_mode'],
+            dt=self.simulation_params['time_step']
+        )
+        env.clean()
+        return env
+    
+    def _setup_yolo_sensor(self):
+        """设置车顶 RGB 摄像头"""
+        if self.vehicle is None: return
+
+        bp_library = self.env.world.get_blueprint_library()
+        camera_bp = bp_library.find('sensor.camera.rgb')
+        # 640x480 是兼顾 YOLOPv2 (640x640) 和 YOLOv11 的合理分辨率
+        camera_bp.set_attribute('image_size_x', '640')
+        camera_bp.set_attribute('image_size_y', '480')
+        camera_bp.set_attribute('fov', '45') # 较窄 FOV 适合看红绿灯
+        
+        spawn_point = carla.Transform(carla.Location(x=1.0, z=2.0))
+        
+        self.yolo_sensor = self.env.world.spawn_actor(
+            camera_bp, spawn_point, attach_to=self.env.ego_vehicle
+        )
+        self.yolo_sensor.listen(self.rgb_queue.put)
+        self.env.actor_list.append(self.yolo_sensor)
+        print("RGB Sensor initialized.")
+
+    def _setup_route(self, start_idx, end_idx):
+        """规划全局路径"""
+        route_planner = GlobalRoutePlanner(self.env.map, self.simulation_params['sample_resolution'])
+        self.route = route_planner.trace_route(
+            self.spawn_points[start_idx].location, 
+            self.spawn_points[end_idx].location
+        )
+        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
+        self.env.reset(spawn_point=self.spawn_points[start_idx])
+        
+    def _initialize_vehicle_and_agent(self, start_idx, end_idx):
+        """初始化车辆和 MPC 智能体"""
+        self.vehicle = Vehicle(
+            actor=self.env.ego_vehicle, horizon=10, 
+            target_v=self.simulation_params['target_speed'],
+            delta_t=self.simulation_params['time_step'], max_iter=30
+        )
+        
+        self.agent = Xagent(self.env, self.vehicle, dt=self.simulation_params['time_step'])
+        self.agent.set_start_end_transforms(start_idx, end_idx)
+        self.agent.plan_route(self.agent._start_transform, self.agent._end_transform)
+    
+    def _update_pygame_display(self, step, extra_info=None, yolo_data=None):
+        """更新显示"""
+        self.env.hud.tick(self.env, self.env.clock)
+        if step == 0: self.env.display.fill((0, 0, 0))
+        self.env.hud.render(self.env.display)
+        
+        # 画中画显示 (AI 视角)
+        if yolo_data:
+            img_rgb, tl_results = yolo_data
+            if img_rgb is not None:
+                # 1. img_rgb 已经包含了 YOLOPv2 的车道线和区域渲染
+                
+                # 2. 绘制红绿灯框 (来自 YOLOv11)
+                for bbox, info in tl_results.items():
+                    x1, y1, x2, y2 = bbox
+                    color_name = info['color']
+                    conf = info.get('conf', 0.0)
+                    
+                    colors = {'RED': (255, 0, 0), 'YELLOW': (255, 255, 0), 'GREEN': (0, 255, 0)}
+                    box_color = colors.get(color_name, (200, 200, 200))
+                    
+                    # ROI Check
+                    img_w = img_rgb.shape[1]
+                    center_x = (x1 + x2) / 2
+                    is_in_roi = (img_w * 0.25 < center_x < img_w * 0.75)
+                    
+                    thickness = 2 if is_in_roi else 1
+                    cv2.rectangle(img_rgb, (x1, y1), (x2, y2), box_color, thickness)
+                    
+                    status = "" if is_in_roi else "(IGN)"
+                    label = f"{color_name} {conf:.2f} {status}"
+                    cv2.putText(img_rgb, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1)
+
+                # 3. 绘制 ROI 辅助线
+                h, w, _ = img_rgb.shape
+                cv2.line(img_rgb, (int(w*0.25), 0), (int(w*0.25), h), (255,255,255), 1)
+                cv2.line(img_rgb, (int(w*0.75), 0), (int(w*0.75), h), (255,255,255), 1)
+
+                # 4. 显示到右上角
+                surf = pygame.surfarray.make_surface(img_rgb.swapaxes(0, 1))
+                self.env.display.blit(surf, (640, 0))
+                pygame.draw.rect(self.env.display, (255, 255, 255), (640, 0, 640, 480), 2)
+        
+        if extra_info:
+            font = pygame.font.SysFont("Arial", 30, bold=True)
+            text = font.render(extra_info, True, (255, 0, 0))
+            self.env.display.blit(text, text.get_rect(center=(640, 500)))
+
+        pygame.display.flip()
+        self.env.check_quit()
+
+    def _process_yolo_detection(self):
+        """
+        处理流程：
+        1. 获取最新图像
+        2. YOLOPv2 -> 检测车道线(红色) & 可行驶区域(绿色) -> 绘制到图像
+        3. OpenCV -> 检测停止线(标注 "STOP LINE") -> 绘制到图像
+        4. YOLOv11 -> 检测红绿灯 -> 返回结果
+        """
+        is_red_light = False
+        info_text = ""
+        img_rgb = None
+        tl_results = {}
+        stop_line_detected = False
+        
+        # 1. 队列处理 (清空积压，只取最新)
+        image_data = None
+        while not self.rgb_queue.empty():
+            image_data = self.rgb_queue.get_nowait()
+        
+        if image_data is None:
+            return is_red_light, info_text, img_rgb, tl_results, stop_line_detected
+
+        try:
+            array = np.frombuffer(image_data.raw_data, dtype=np.dtype("uint8"))
+            array = np.reshape(array, (image_data.height, image_data.width, 4))
+            raw_img_rgb = array[:, :, :3][:, :, ::-1].copy()
+            img_rgb = raw_img_rgb.copy()
+            
+            # 2. YOLOPv2 推理 (Lane + Drivable Area)
+            if self.yolopv2_detector:
+                img_rgb = self.yolopv2_detector.infer(raw_img_rgb)
+            
+            # 3. 停止线检测 (辅助)
+            stop_line_detected = detect_stop_lines(raw_img_rgb)
+            if stop_line_detected:
+                cv2.putText(img_rgb, "STOP LINE", (20, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # 4. YOLOv11 红绿灯检测
+            if self.yolo_model:
+                results = self.yolo_model(raw_img_rgb, verbose=False)
+                tl_results = traffic_light.detect_traffic_lights(
+                    raw_img_rgb, results, self.yolo_model.names, method='hsv'
+                )
+                
+                img_w = img_rgb.shape[1]
+                for bbox, info in tl_results.items():
+                    if info['color'] == 'RED':
+                        x1, y1, x2, y2 = bbox
+                        center_x = (x1 + x2) / 2
+                        height = y2 - y1
+                        
+                        # ROI 过滤 (只看中间 50%)
+                        if center_x < img_w * 0.25 or center_x > img_w * 0.75:
+                            continue
+                        
+                        if height > 20: 
+                            is_red_light = True
+                            info_text = "RED LIGHT! STOP!"
+                            break
+                            
+        except Exception as e:
+            print(f"Detection error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        return is_red_light, info_text, img_rgb, tl_results, stop_line_detected
+
+    def _is_vehicle_in_junction(self):
+        """检查车辆是否在路口"""
+        if self.env.ego_vehicle and self.env.map:
+            loc = self.env.ego_vehicle.get_location()
+            wp = self.env.map.get_waypoint(loc, project_to_road=True)
+            return wp.is_junction
+        return False
+    
+    def run_simulation(self, start_idx=75, end_idx=40):
+        try:
+            self._setup_route(start_idx, end_idx)
+            self._initialize_vehicle_and_agent(start_idx, end_idx)
+            if self.env.display_method == "pygame": self.env.init_display()
+            self._setup_yolo_sensor()
+            
+            for step in range(self.simulation_params['max_simulation_steps']):
+                # 执行检测
+                is_red, info, img, tl_res, is_stop = self._process_yolo_detection()
+                
+                # 执行 MPC
+                acc, steer, next_state = self.agent.run_step()
+                
+                # 停车逻辑: 红灯 且 (不在路口 或 看到停止线)
+                if is_red and not self._is_vehicle_in_junction():
+                    acc = -4.0
+                    if is_stop: info += " (LINE)"
+                
+                self._record_simulation_data(step, next_state, acc, steer)
+                self.env.step([acc, steer])
+                
+                if self.env.display_method == "pygame":
+                    yolo_data = (img, tl_res) if img is not None else None
+                    self._update_pygame_display(step, extra_info=info, yolo_data=yolo_data)
+                
+                if self._check_destination_reached(next_state):
+                    print("Destination reached!"); break
+                    
+        except KeyboardInterrupt:
+            print("User interrupted.")
+        except Exception as e:
+            print(f"Simulation error: {e}")
+        finally:
+            self._visualize_results()
+
+def main():
+    sim = MPCCarSimulation()
+    sim.run_simulation()
+
+if __name__ == "__main__":
+    main()

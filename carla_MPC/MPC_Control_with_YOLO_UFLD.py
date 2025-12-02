@@ -16,7 +16,6 @@ sys.path.insert(0, str(traffic_detection_path))
 sys.path.insert(0, str(pathlib.Path(__file__).with_name('src')))
 
 # 2. 添加 Ultra-Fast-Lane-Detection 项目路径
-# 假设你把该项目 clone 到了 carla_MPC 的同级目录，或者直接修改下面的路径指向该项目根目录
 ufld_project_path = 'carla_MPC/Ultra-Fast-Lane-Detection'
 sys.path.insert(0, str(ufld_project_path))
 
