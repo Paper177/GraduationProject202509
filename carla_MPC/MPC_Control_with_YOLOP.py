@@ -38,16 +38,26 @@ import time
 import pygame
 import carla
 
-# --- 辅助函数：停止线检测 (OpenCV) ---
-def detect_stop_lines(img_rgb):
-    """检测路口停止线 (保留 OpenCV 逻辑作为辅助)"""
-    height, width = img_rgb.shape[:2]
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
+# --- 辅助函数：停止线检测 (基于 YOLOP 掩码) ---
+def detect_stop_lines(lane_mask):
+    """
+    检测路口停止线 (使用 YOLOP 推理的车道线掩码)
+    Args:
+        lane_mask: uint8 numpy array, YOLOP 输出的车道线掩码 (0或255)
+    """
+    if lane_mask is None:
+        return False
+
+    height, width = lane_mask.shape[:2]
     
+    # YOLOP 的掩码已经是二值化的线条，直接作为边缘图使用
+    # 无需 cv2.Canny，但可以做一个简单的形态学操作让断断续续的线连起来（可选）
+    # kernel = np.ones((3,3), np.uint8)
+    # edges = cv2.dilate(lane_mask, kernel, iterations=1)
+    edges = lane_mask
+
     mask = np.zeros_like(edges)
-    # 梯形 ROI
+    # 梯形 ROI (Region of Interest) - 只关注车头前方地面
     polygons = np.array([[
         (0, height), (width, height),
         (int(width * 0.7), int(height * 0.6)),
@@ -56,7 +66,9 @@ def detect_stop_lines(img_rgb):
     cv2.fillPoly(mask, polygons, 255)
     masked_edges = cv2.bitwise_and(edges, mask)
     
-    lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 30, minLineLength=30, maxLineGap=20)
+    # 霍夫直线变换
+    # minLineLength 可以适当调小，因为分割出的线可能不如原始边缘连续
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 30, minLineLength=20, maxLineGap=20)
     stop_line_detected = False
     
     if lines is not None:
@@ -65,8 +77,11 @@ def detect_stop_lines(img_rgb):
             if x2 - x1 == 0: slope = 999.0
             else: slope = (y2 - y1) / (x2 - x1)
             
-            # 停止线判定：水平且靠下
-            if abs(slope) < 0.1 and min(y1, y2) > height * 0.65:
+            # 停止线判定：
+            # 1. 斜率接近水平 (abs(slope) < 0.15)
+            # 2. 位置靠下 (y > height * 0.65)
+            # 注意：YOLOP 主要检测纵向车道线，但路口横向停止线经常也会被分割出来
+            if abs(slope) < 0.15 and min(y1, y2) > height * 0.65:
                 stop_line_detected = True
                 break
     return stop_line_detected
@@ -116,52 +131,50 @@ class YOLOPDetector:
         执行 YOLOP 推理
         Returns:
             img_vis: 叠加了车道线和可行驶区域的图像
+            ll_seg_mask: 车道线二值掩码 (uint8, 0或255)
+            da_seg_mask: 可行驶区域二值掩码 (uint8, 0或255)
         """
         if self.model is None:
-            return img_rgb
+            # 如果模型未加载，返回原图和空掩码
+            return img_rgb, None, None
 
         img_h, img_w = img_rgb.shape[:2]
         
         # 1. 预处理
-        # YOLOP 需要 resize 到 640x640
         img_resized = cv2.resize(img_rgb, (640, 640))
         input_tensor = self.transform(img_resized).unsqueeze(0).to(self.device)
         
         # 2. 推理
         with torch.no_grad():
-            # det_out: (1, n, 6) detection
-            # da_seg_out: (1, 2, 640, 640) drivable area
-            # ll_seg_out: (1, 2, 640, 640) lane line
             det_out, da_seg_out, ll_seg_out = self.model(input_tensor)
             
         # 3. 后处理 - 分割掩码
         # Drivable Area
         da_seg_mask = torch.nn.functional.interpolate(da_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
         da_seg_mask = torch.argmax(da_seg_mask, dim=1).squeeze().cpu().numpy() # 0 or 1
+        da_seg_mask = (da_seg_mask * 255).astype(np.uint8)
         
         # Lane Line
         ll_seg_mask = torch.nn.functional.interpolate(ll_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
         ll_seg_mask = torch.argmax(ll_seg_mask, dim=1).squeeze().cpu().numpy() # 0 or 1
+        ll_seg_mask = (ll_seg_mask * 255).astype(np.uint8)
         
         # 4. 可视化叠加
         img_vis = img_rgb.copy()
         
         # 绘制可行驶区域 (蓝色，半透明)
         color_area = np.zeros_like(img_vis)
-        color_area[da_seg_mask == 1] = [0, 0, 255] # RGB: Blue
-        # 只有掩码区域才混合
-        mask_bool = (da_seg_mask == 1)
-        img_vis[mask_bool] = cv2.addWeighted(img_vis[mask_bool], 0.7, color_area[mask_bool], 0.3, 0).squeeze()
+        color_area[da_seg_mask > 0] = [0, 0, 255] # RGB: Blue
         
-        # 绘制车道线 (绿色，不透明或高亮)
-        # 膨胀一下车道线让显示更清晰
-        ll_seg_mask = (ll_seg_mask * 255).astype(np.uint8)
-        # kernel = np.ones((3,3), np.uint8)
-        # ll_seg_mask = cv2.dilate(ll_seg_mask, kernel, iterations=1)
+        mask_bool = (da_seg_mask > 0)
+        if mask_bool.any():
+            img_vis[mask_bool] = cv2.addWeighted(img_vis[mask_bool], 0.7, color_area[mask_bool], 0.3, 0).squeeze()
         
+        # 绘制车道线 (绿色)
+        # 这里的 ll_seg_mask 已经是二值化的边缘了，可以直接用来显示
         img_vis[ll_seg_mask > 100] = [0, 255, 0] # RGB: Green
         
-        return img_vis
+        return img_vis, ll_seg_mask, da_seg_mask
 
 
 class MPCCarSimulation:
@@ -275,7 +288,7 @@ class MPCCarSimulation:
             self.spawn_points[start_idx].location, 
             self.spawn_points[end_idx].location
         )
-        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
+       # draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
         self.env.reset(spawn_point=self.spawn_points[start_idx])
         
     def _initialize_vehicle_and_agent(self, start_idx, end_idx):
@@ -342,9 +355,9 @@ class MPCCarSimulation:
         """
         处理流程：
         1. 获取最新图像
-        2. YOLOP -> 检测车道线 & 可行驶区域 -> 绘制到图像
-        3. OpenCV -> 检测停止线 -> 绘制到图像
-        4. YOLOv11 -> 检测红绿灯 -> 返回结果
+        2. YOLOP -> 检测车道线 (获取掩码) -> 传递给停止线检测
+        3. 停止线检测 -> 使用 YOLOP 掩码判断
+        4. YOLOv11 -> 检测红绿灯
         """
         is_red_light = False
         info_text = ""
@@ -365,13 +378,21 @@ class MPCCarSimulation:
             array = np.reshape(array, (image_data.height, image_data.width, 4))
             raw_img_rgb = array[:, :, :3][:, :, ::-1].copy()
             img_rgb = raw_img_rgb.copy()
+            ll_mask = None # 初始化
             
             # 2. YOLOP 推理 (Lane + Drivable Area)
             if self.yolop_detector:
-                img_rgb = self.yolop_detector.infer(raw_img_rgb)
+                # 修改：接收三个返回值
+                img_rgb, ll_mask, da_mask = self.yolop_detector.infer(raw_img_rgb)
             
-            # 3. 停止线检测 (辅助)
-            stop_line_detected = detect_stop_lines(raw_img_rgb)
+            # 3. 停止线检测 (使用 YOLOP 掩码)
+            # 如果 YOLOP 不可用或未检测到，ll_mask 为 None 或全黑
+            if ll_mask is not None:
+                stop_line_detected = detect_stop_lines(ll_mask)
+            else:
+                # 备用方案：如果没有 YOLOP，可以使用原来的基于 Canny 的逻辑
+                # 但根据您的要求，这里我们假设主要依赖 YOLOP，或者您可以保留原来的作为 else 分支
+                pass 
             
             # 4. YOLOv11 红绿灯检测
             if self.yolo_model:
