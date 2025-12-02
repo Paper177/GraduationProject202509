@@ -372,8 +372,6 @@ class MPCCarSimulation:
             
             # 3. 停止线检测 (辅助)
             stop_line_detected = detect_stop_lines(raw_img_rgb)
-            if stop_line_detected:
-                cv2.putText(img_rgb, "STOP LINE", (20, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
             
             # 4. YOLOv11 红绿灯检测
             if self.yolo_model:
