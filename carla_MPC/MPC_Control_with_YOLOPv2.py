@@ -56,7 +56,7 @@ class YOLOPv2Detector:
             return
 
         # 定位本地 YOLOPv2 仓库
-        self.repo_path = pathlib.Path('carla_MPC/YOLOPv2')
+        self.repo_path = pathlib.Path('YOLOPv2')
         
         try:
             print("Loading YOLOPv2 model...")

@@ -82,7 +82,7 @@ class YOLOPDetector:
             return
 
         # 1. 尝试定位本地 YOLOP 仓库
-        yolop_local_path = pathlib.Path('carla_MPC/YOLOP')
+        yolop_local_path = pathlib.Path('YOLOP')
         
         try:
             print("Loading YOLOP model...")
