@@ -13,7 +13,7 @@ import pygame
 
 # Simulation parameters
 simu_step = 0.05  # Time step per simulation step (seconds)
-target_v = 40  # Target speed (km/h)
+target_v = 60  # Target speed (km/h)
 sample_res = 2.0  # Sampling resolution for path planning
 display_mode = "spec"  # Options: "spec" or "pygame"
 

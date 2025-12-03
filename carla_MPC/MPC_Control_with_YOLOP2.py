@@ -39,25 +39,22 @@ import pygame
 import carla
 
 # --- 辅助函数：停止线检测 (基于 YOLOP 掩码) ---
-def detect_stop_lines(lane_mask):
+# --- 修改处：增加 current_speed 参数 ---
+def detect_stop_lines(lane_mask, current_speed=0.0):
     """
-    检测路口停止线 (使用 YOLOP 推理的车道线掩码)
+    检测路口停止线 (基于 YOLOP 掩码 + 速度动态阈值)
     Args:
-        lane_mask: uint8 numpy array, YOLOP 输出的车道线掩码 (0或255)
+        lane_mask: YOLOP 输出的车道线掩码
+        current_speed: 当前车速 (km/h)
     """
     if lane_mask is None:
         return False
 
     height, width = lane_mask.shape[:2]
-    
-    # YOLOP 的掩码已经是二值化的线条，直接作为边缘图使用
-    # 无需 cv2.Canny，但可以做一个简单的形态学操作让断断续续的线连起来（可选）
-    # kernel = np.ones((3,3), np.uint8)
-    # edges = cv2.dilate(lane_mask, kernel, iterations=1)
     edges = lane_mask
 
     mask = np.zeros_like(edges)
-    # 梯形 ROI (Region of Interest) - 只关注车头前方地面
+    # 梯形 ROI (关注车头前方)
     polygons = np.array([[
         (0, height), (width, height),
         (int(width * 0.7), int(height * 0.6)),
@@ -66,10 +63,17 @@ def detect_stop_lines(lane_mask):
     cv2.fillPoly(mask, polygons, 255)
     masked_edges = cv2.bitwise_and(edges, mask)
     
-    # 霍夫直线变换
-    # minLineLength 可以适当调小，因为分割出的线可能不如原始边缘连续
     lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 30, minLineLength=20, maxLineGap=20)
     stop_line_detected = False
+    
+    # --- 动态阈值计算 ---
+    # 速度越快，阈值越小 (需要在停止线处于画面更上方/更远处时就反应)
+    # 0 km/h -> 0.85 (近)
+    # 50 km/h -> 0.50 (远)
+    # 限制范围 [0.45, 0.85] 防止误判
+    dynamic_threshold = 0.75 - (current_speed * 0.007)
+    dynamic_threshold = np.clip(dynamic_threshold, 0.45, 0.75)
+    # -------------------
     
     if lines is not None:
         for line in lines:
@@ -78,11 +82,12 @@ def detect_stop_lines(lane_mask):
             else: slope = (y2 - y1) / (x2 - x1)
             
             # 停止线判定：
-            # 1. 斜率接近水平 (abs(slope) < 0.15)
-            # 2. 位置靠下 (y > height * 0.65)
-            # 注意：YOLOP 主要检测纵向车道线，但路口横向停止线经常也会被分割出来
-            if abs(slope) < 0.15 and min(y1, y2) > height * 0.85:
+            # 1. 斜率水平
+            # 2. Y坐标大于动态阈值
+            if abs(slope) < 0.1 and min(y1, y2) > height * dynamic_threshold:
                 stop_line_detected = True
+                # 可选：打印调试信息看看阈值变化
+                # print(f"Speed: {current_speed:.1f}, Thresh: {dynamic_threshold:.2f}, LineY: {min(y1, y2)/height:.2f}")
                 break
     return stop_line_detected
 
@@ -96,7 +101,7 @@ class YOLOPDetector:
         if not TORCH_AVAILABLE:
             return
 
-        # 1. 尝试定位本地 YOLOP 仓库
+        # 1. 定位YOLOP
         yolop_local_path = pathlib.Path('YOLOP')
         
         try:
@@ -135,7 +140,6 @@ class YOLOPDetector:
             da_seg_mask: 可行驶区域二值掩码 (uint8, 0或255)
         """
         if self.model is None:
-            # 如果模型未加载，返回原图和空掩码
             return img_rgb, None, None
 
         img_h, img_w = img_rgb.shape[:2]
@@ -182,12 +186,12 @@ class MPCCarSimulation:
     
     def __init__(self):
         """初始化仿真参数和环境"""
-        # 仿真参数配置
+        # ... (前面的参数保持不变) ...
         self.simulation_params = {
-            'time_step': 0.05,         # 仿真时间步长（秒）
-            'target_speed': 60,        # 目标速度（km/h）
-            'sample_resolution': 2.0,  # 路径规划采样分辨率
-            'display_mode': "pygame",  # 显示模式
+            'time_step': 0.05,
+            'target_speed': 30,
+            'sample_resolution': 2.0,
+            'display_mode': "spec",
             'max_simulation_steps': 5000, 
             'destination_threshold': 1.0, 
             'map_name': "Town05"       
@@ -208,10 +212,15 @@ class MPCCarSimulation:
         self.route = None
         
         # AI 模型相关
-        self.yolo_model = None      # YOLOv11 (红绿灯)
-        self.yolop_detector = None  # YOLOP (车道线/路面)
-        self.rgb_queue = queue.Queue()
-        self.yolo_sensor = None
+        self.yolo_model = None      # YOLOv11 (红绿灯 - 长焦)
+        self.yolop_detector = None  # YOLOP (车道/路面 - 广角)
+        
+        # --- 修改处：定义双目摄像头的队列和传感器变量 ---
+        self.wide_queue = queue.Queue() # 广角队列
+        self.tele_queue = queue.Queue() # 长焦队列
+        self.wide_sensor = None
+        self.tele_sensor = None
+        # -------------------------------------------
         
         self._init_models()
 
@@ -261,28 +270,48 @@ class MPCCarSimulation:
         env.clean()
         return env
     
-    def _setup_yolo_sensor(self):
-        """设置车顶 RGB 摄像头"""
+    def _setup_sensors(self):
+        """设置双目摄像头系统 (广角 + 长焦)"""
         if self.vehicle is None: return
 
         bp_library = self.env.world.get_blueprint_library()
-        camera_bp = bp_library.find('sensor.camera.rgb')
         
-        # --- 修改处：将分辨率改为 720p (1280x720) ---
-        camera_bp.set_attribute('image_size_x', '1280')
-        camera_bp.set_attribute('image_size_y', '720')
-        # ------------------------------------------
+        # --- 1. 广角摄像头 (Wide) ---
+        bp_wide = bp_library.find('sensor.camera.rgb')
+        bp_wide.set_attribute('image_size_x', '1280')
+        bp_wide.set_attribute('image_size_y', '720')
+        bp_wide.set_attribute('fov', '90')
+        # 关键：设置为 0.0 确保每帧都生成数据
+        bp_wide.set_attribute('sensor_tick', '0.0') 
         
-        camera_bp.set_attribute('fov', '40') # 较窄 FOV 适合看红绿灯
+        spawn_point_wide = carla.Transform(carla.Location(x=1.0, z=2.0))
         
-        spawn_point = carla.Transform(carla.Location(x=1.0, z=2.0))
-        
-        self.yolo_sensor = self.env.world.spawn_actor(
-            camera_bp, spawn_point, attach_to=self.env.ego_vehicle
+        # --- 修改处：添加 attachment_type=carla.AttachmentType.Rigid ---
+        self.wide_sensor = self.env.world.spawn_actor(
+            bp_wide, spawn_point_wide, attach_to=self.env.ego_vehicle,
+            attachment_type=carla.AttachmentType.Rigid
         )
-        self.yolo_sensor.listen(self.rgb_queue.put)
-        self.env.actor_list.append(self.yolo_sensor)
-        print("RGB Sensor initialized (1280x720).")
+        self.wide_sensor.listen(self.wide_queue.put)
+        self.env.actor_list.append(self.wide_sensor)
+
+        # --- 2. 长焦摄像头 (Tele) ---
+        bp_tele = bp_library.find('sensor.camera.rgb')
+        bp_tele.set_attribute('image_size_x', '1280')
+        bp_tele.set_attribute('image_size_y', '720')
+        bp_tele.set_attribute('fov', '35')
+        bp_tele.set_attribute('sensor_tick', '0.0')
+        
+        spawn_point_tele = carla.Transform(carla.Location(x=1.0, z=2.0))
+        
+        # --- 修改处：添加 attachment_type=carla.AttachmentType.Rigid ---
+        self.tele_sensor = self.env.world.spawn_actor(
+            bp_tele, spawn_point_tele, attach_to=self.env.ego_vehicle,
+            attachment_type=carla.AttachmentType.Rigid
+        )
+        self.tele_sensor.listen(self.tele_queue.put)
+        self.env.actor_list.append(self.tele_sensor)
+        
+        print("Dual Camera System initialized (Rigid Attachment).")
 
     def _setup_route(self, start_idx, end_idx):
         """规划全局路径"""
@@ -291,7 +320,7 @@ class MPCCarSimulation:
             self.spawn_points[start_idx].location, 
             self.spawn_points[end_idx].location
         )
-       # draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
+        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
         self.env.reset(spawn_point=self.spawn_points[start_idx])
         
     def _initialize_vehicle_and_agent(self, start_idx, end_idx):
@@ -306,137 +335,167 @@ class MPCCarSimulation:
         self.agent.set_start_end_transforms(start_idx, end_idx)
         self.agent.plan_route(self.agent._start_transform, self.agent._end_transform)
     
-    def _update_pygame_display(self, step, extra_info=None, yolo_data=None):
-        """更新显示"""
+    def _update_pygame_display(self, step, is_red=False, is_stop=False, brake_info="", yolo_data=None):
+        """
+        更新显示
+        Args:
+            step: 当前仿真步数
+            is_red: 是否检测到红灯 (bool)
+            is_stop: 是否检测到停止线 (bool)
+            brake_info: 刹车状态附加信息 (str)
+            yolo_data: (img_wide, img_tele) 元组
+        """
         self.env.hud.tick(self.env, self.env.clock)
         if step == 0: self.env.display.fill((0, 0, 0))
         self.env.hud.render(self.env.display)
         
-        # 画中画显示
+        # --- 画中画显示 (右侧) ---
         if yolo_data:
-            img_rgb, tl_results = yolo_data
-            if img_rgb is not None:
-                # 绘制红绿灯框 (此时 img_rgb 是 1280x720)
-                # 注意：这里的检测框坐标已经是基于 1280x720 的，直接绘制即可
-                for bbox, info in tl_results.items():
-                    x1, y1, x2, y2 = bbox
-                    color_name = info['color']
-                    conf = info.get('conf', 0.0)
-                    
-                    colors = {'RED': (255, 0, 0), 'YELLOW': (255, 255, 0), 'GREEN': (0, 255, 0)}
-                    box_color = colors.get(color_name, (200, 200, 200))
-                    
-                    # ROI Check
-                    img_w = img_rgb.shape[1]
-                    center_x = (x1 + x2) / 2
-                    is_in_roi = (img_w * 0.25 < center_x < img_w * 0.75)
-                    
-                    thickness = 2 if is_in_roi else 1
-                    cv2.rectangle(img_rgb, (x1, y1), (x2, y2), box_color, thickness)
-                    
-                    status = "" if is_in_roi else "(IGN)"
-                    label = f"{color_name} {conf:.2f} {status}"
-                    # 字体大小可以稍微调大一点适应高分辨率
-                    cv2.putText(img_rgb, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
-
-                # ROI Lines
-                h, w, _ = img_rgb.shape
-                cv2.line(img_rgb, (int(w*0.25), 0), (int(w*0.25), h), (255,255,255), 2)
-                cv2.line(img_rgb, (int(w*0.75), 0), (int(w*0.75), h), (255,255,255), 2)
-
-                # --- 修改处：缩放图像以适应显示窗口 ---
-                # 将 1280x720 缩放到宽度 640，保持比例 (高度变为 360)
-                # 这样可以保证界面不崩坏，同时保留 720p 的视野内容
-                img_display = cv2.resize(img_rgb, (640, 360))
-                
-                surf = pygame.surfarray.make_surface(img_display.swapaxes(0, 1))
-                self.env.display.blit(surf, (640, 0))
-                
-                # 绘制边框 (高度调整为 360)
+            img_wide, img_tele = yolo_data
+            
+            # 1. 广角视图 (Top)
+            if img_wide is not None:
+                display_wide = cv2.resize(img_wide, (640, 360))
+                cv2.putText(display_wide, "Wide Angle (Lane)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                surf_wide = pygame.surfarray.make_surface(display_wide.swapaxes(0, 1))
+                self.env.display.blit(surf_wide, (640, 0))
                 pygame.draw.rect(self.env.display, (255, 255, 255), (640, 0, 640, 360), 2)
-                # -----------------------------------
+
+            # 2. 长焦视图 (Bottom)
+            if img_tele is not None:
+                display_tele = cv2.resize(img_tele, (640, 360))
+                cv2.putText(display_tele, "Telephoto (Traffic Light)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                surf_tele = pygame.surfarray.make_surface(display_tele.swapaxes(0, 1))
+                self.env.display.blit(surf_tele, (640, 360))
+                pygame.draw.rect(self.env.display, (255, 255, 255), (640, 360, 640, 360), 2)
         
-        if extra_info:
-            font = pygame.font.SysFont("Arial", 30, bold=True)
-            text = font.render(extra_info, True, (255, 0, 0))
-            # 调整提示文字的位置
-            self.env.display.blit(text, text.get_rect(center=(640, 400)))
+        # --- 修改处：左下角状态提示信息 ---
+        font = pygame.font.SysFont("Arial", 25, bold=True)
+        base_y = self.env.display.get_height() - 100 # 起始 Y 坐标 (左下角)
+        
+        # 1. 红灯提示 (红色)
+        if is_red:
+            text_red = font.render("WARNING: RED LIGHT DETECTED", True, (255, 0, 0))
+            pygame.draw.rect(self.env.display, (0,0,0), (20, base_y, text_red.get_width()+10, 30)) # 黑色背景衬托
+            self.env.display.blit(text_red, (25, base_y))
+            base_y += 35 # 下一行位置
+            
+        # 2. 停止线提示 (青色)
+        if is_stop:
+            text_line = font.render("INFO: STOP LINE DETECTED", True, (0, 255, 255))
+            pygame.draw.rect(self.env.display, (0,0,0), (20, base_y, text_line.get_width()+10, 30))
+            self.env.display.blit(text_line, (25, base_y))
+            base_y += 35
+
+        # 3. 刹车提示 (黄色)
+        if brake_info:
+            text_brake = font.render(f"ACTION: {brake_info}", True, (255, 255, 0))
+            pygame.draw.rect(self.env.display, (0,0,0), (20, base_y, text_brake.get_width()+10, 30))
+            self.env.display.blit(text_brake, (25, base_y))
+        # --------------------------------
 
         pygame.display.flip()
         self.env.check_quit()
 
     def _process_yolo_detection(self):
         """
-        处理流程：
-        1. 获取最新图像
-        2. YOLOP -> 检测车道线 (获取掩码) -> 传递给停止线检测
-        3. 停止线检测 -> 使用 YOLOP 掩码判断
-        4. YOLOv11 -> 检测红绿灯
+        双流感知处理：加入车速读取，实现动态停止线检测
         """
         is_red_light = False
         info_text = ""
-        img_rgb = None
+        img_wide_vis = None
+        img_tele_vis = None
         tl_results = {}
         stop_line_detected = False
         
-        # 1. 队列处理
-        image_data = None
-        while not self.rgb_queue.empty():
-            image_data = self.rgb_queue.get_nowait()
+        def get_latest_frame(q, timeout=2.0):
+            try:
+                data = q.get(timeout=timeout)
+                while not q.empty():
+                    try:
+                        data = q.get_nowait()
+                    except queue.Empty:
+                        break
+                return data
+            except queue.Empty:
+                return None
         
-        if image_data is None:
-            return is_red_light, info_text, img_rgb, tl_results, stop_line_detected
+        data_wide = get_latest_frame(self.wide_queue)
+        data_tele = get_latest_frame(self.tele_queue)
+        
+        if data_wide is None or data_tele is None:
+            return is_red_light, info_text, None, None, {}, False
 
         try:
-            array = np.frombuffer(image_data.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image_data.height, image_data.width, 4))
-            raw_img_rgb = array[:, :, :3][:, :, ::-1].copy()
-            img_rgb = raw_img_rgb.copy()
-            ll_mask = None # 初始化
+            # --- 1. 获取当前车速 (km/h) ---
+            # 如果车辆还未生成，速度为0
+            current_speed = 0.0
+            if self.env.ego_vehicle:
+                v = self.env.ego_vehicle.get_velocity()
+                current_speed = 3.6 * np.sqrt(v.x**2 + v.y**2 + v.z**2)
+            # ---------------------------
+
+            # --- 处理广角图像 (Wide) ---
+            array_wide = np.frombuffer(data_wide.raw_data, dtype=np.dtype("uint8"))
+            array_wide = np.reshape(array_wide, (data_wide.height, data_wide.width, 4))
+            raw_wide = array_wide[:, :, :3][:, :, ::-1].copy()
+            img_wide_vis = raw_wide.copy()
             
-            # 2. YOLOP 推理 (Lane + Drivable Area)
+            ll_mask = None
             if self.yolop_detector:
-                # 修改：接收三个返回值
-                img_rgb, ll_mask, da_mask = self.yolop_detector.infer(raw_img_rgb)
+                img_wide_vis, ll_mask, _ = self.yolop_detector.infer(raw_wide)
             
-            # 3. 停止线检测 (使用 YOLOP 掩码)
-            # 如果 YOLOP 不可用或未检测到，ll_mask 为 None 或全黑
+            # --- 修改处：传入车速进行停止线检测 ---
             if ll_mask is not None:
-                stop_line_detected = detect_stop_lines(ll_mask)
-            else:
-                # 备用方案：如果没有 YOLOP，可以使用原来的基于 Canny 的逻辑
-                # 但根据您的要求，这里我们假设主要依赖 YOLOP，或者您可以保留原来的作为 else 分支
-                pass 
+                stop_line_detected = detect_stop_lines(ll_mask, current_speed)
+            # -----------------------------------
+
+            # --- 处理长焦图像 (Tele) ---
+            array_tele = np.frombuffer(data_tele.raw_data, dtype=np.dtype("uint8"))
+            array_tele = np.reshape(array_tele, (data_tele.height, data_tele.width, 4))
+            raw_tele = array_tele[:, :, :3][:, :, ::-1].copy()
+            img_tele_vis = raw_tele.copy()
+
+            # ROI 裁剪 (Top 30%, Center 30%)
+            h, w = raw_tele.shape[:2]
+            roi_h_end = int(h * 0.3)
+            roi_w_start = int(w * 0.35)
+            roi_w_end = int(w * 0.65)
             
-            # 4. YOLOv11 红绿灯检测
-            if self.yolo_model:
-                results = self.yolo_model(raw_img_rgb, verbose=False)
+            tele_roi = raw_tele[0:roi_h_end, roi_w_start:roi_w_end]
+
+            if self.yolo_model and tele_roi.size > 0:
+                results = self.yolo_model(tele_roi, verbose=False)
                 tl_results = traffic_light.detect_traffic_lights(
-                    raw_img_rgb, results, self.yolo_model.names, method='hsv'
+                    tele_roi, results, self.yolo_model.names, method='hsv'
                 )
                 
-                img_w = img_rgb.shape[1]
                 for bbox, info in tl_results.items():
-                    if info['color'] == 'RED':
-                        x1, y1, x2, y2 = bbox
-                        center_x = (x1 + x2) / 2
-                        height = y2 - y1
-                        
-                        # ROI 过滤 (只看中间 30%)
-                        if center_x < img_w * 0.35 or center_x > img_w * 0.65:
-                            continue
-                        
-                        if height > 20: 
+                    color = info['color']
+                    x1_roi, y1_roi, x2_roi, y2_roi = bbox
+                    
+                    x1 = x1_roi + roi_w_start
+                    x2 = x2_roi + roi_w_start
+                    y1 = y1_roi
+                    y2 = y2_roi
+                    
+                    if color == 'RED':
+                        if (y2 - y1) > 10: 
                             is_red_light = True
-                            info_text = "RED LIGHT! STOP!"
-                            break
-                            
+                            info_text = "RED LIGHT!"
+                    
+                    c_rgb = (0, 0, 255) if color=='RED' else ((0, 255, 0) if color=='GREEN' else (255, 255, 0))
+                    cv2.rectangle(img_tele_vis, (x1, y1), (x2, y2), c_rgb, 2)
+                    cv2.putText(img_tele_vis, color, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c_rgb, 1)
+
+            cv2.rectangle(img_tele_vis, (roi_w_start, 0), (roi_w_end, roi_h_end), (200, 200, 200), 1)
+
         except Exception as e:
             print(f"Detection error: {e}")
             import traceback
             traceback.print_exc()
             
-        return is_red_light, info_text, img_rgb, tl_results, stop_line_detected
+        return is_red_light, info_text, img_wide_vis, img_tele_vis, tl_results, stop_line_detected
 
     def _is_vehicle_in_junction(self):
         """检查车辆是否在路口"""
@@ -530,24 +589,47 @@ class MPCCarSimulation:
             self._setup_route(start_idx, end_idx)
             self._initialize_vehicle_and_agent(start_idx, end_idx)
             if self.env.display_method == "pygame": self.env.init_display()
-            self._setup_yolo_sensor()
+            
+            self._setup_sensors()
+            
+            # 定义正常巡航速度 (km/h)
+            cruise_speed = self.simulation_params['target_speed']
             
             for step in range(self.simulation_params['max_simulation_steps']):
-                is_red, info, img, tl_res, is_stop = self._process_yolo_detection()
+                # 1. 感知
+                is_red, _, img_w, img_t, tl_res, is_stop = self._process_yolo_detection()
                 
+                # 2. 决策：修改 MPC 目标速度
+                brake_msg = ""
+                
+                # 刹车条件：红灯 AND 停止线 AND 不在路口中间
+                if is_red and is_stop:
+                    # --- 关键修改：通过 MPC 设定目标速度为 0 来刹车 ---
+                    # 注意：agent._model 是 mcp_controller.py 中的 Vehicle 类实例
+                    # set_target_velocity 接收 km/h
+                    self.agent._model.set_target_velocity(0.0) 
+                    brake_msg = "BRAKING"
+                else:
+                    # --- 恢复正常巡航速度 ---
+                    # 必须显式设置回去，否则车辆会一直停着
+                    self.agent._model.set_target_velocity(cruise_speed)
+                
+                # 3. 规划与控制：运行 MPC
+                # MPC 内部会读取刚才设置的 target_v 来生成轨迹
                 acc, steer, next_state = self.agent.run_step()
-                
-                # 停车逻辑: 红灯 且 (不在路口 或 看到停止线)
-                if is_red and not self._is_vehicle_in_junction():
-                    acc = -4.0
-                    if is_stop: info += " (LINE)"
                 
                 self._record_simulation_data(step, next_state, acc, steer)
                 self.env.step([acc, steer])
                 
                 if self.env.display_method == "pygame":
-                    yolo_data = (img, tl_res) if img is not None else None
-                    self._update_pygame_display(step, extra_info=info, yolo_data=yolo_data)
+                    yolo_data = (img_w, img_t) if img_w is not None else None
+                    self._update_pygame_display(
+                        step, 
+                        is_red=is_red, 
+                        is_stop=is_stop, 
+                        brake_info=brake_msg,
+                        yolo_data=yolo_data
+                    )
                 
                 if self._check_destination_reached(next_state):
                     print("Destination reached!"); break
@@ -556,6 +638,8 @@ class MPCCarSimulation:
             print("User interrupted.")
         except Exception as e:
             print(f"Simulation error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             self._visualize_results()
 
