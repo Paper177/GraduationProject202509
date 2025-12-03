@@ -38,42 +38,36 @@ import time
 import pygame
 import carla
 
-# --- 辅助函数：停止线检测 (基于 YOLOP 掩码) ---
-# --- 修改处：增加 current_speed 参数 ---
+#停止线检测
 def detect_stop_lines(lane_mask, current_speed=0.0):
     """
-    检测路口停止线 (基于 YOLOP 掩码 + 速度动态阈值)
-    Args:
-        lane_mask: YOLOP 输出的车道线掩码
-        current_speed: 当前车速 (km/h)
+    检测路口停止线
     """
     if lane_mask is None:
-        return False
+        return False, None
 
     height, width = lane_mask.shape[:2]
+    
+    # 简单的形态学操作，连接断裂的线 (可选)
+    # kernel = np.ones((3,3), np.uint8)
+    # lane_mask = cv2.dilate(lane_mask, kernel, iterations=1)
+    
     edges = lane_mask
-
     mask = np.zeros_like(edges)
-    # 梯形 ROI (关注车头前方)
+    
+    # ROI: 关注车道前方区域
     polygons = np.array([[
         (0, height), (width, height),
-        (int(width * 0.7), int(height * 0.6)),
-        (int(width * 0.3), int(height * 0.6))
+        (int(width * 0.7), int(height * 0.55)), # 稍微调高 ROI 顶部
+        (int(width * 0.3), int(height * 0.55))
     ]])
     cv2.fillPoly(mask, polygons, 255)
     masked_edges = cv2.bitwise_and(edges, mask)
     
     lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 30, minLineLength=20, maxLineGap=20)
-    stop_line_detected = False
     
-    # --- 动态阈值计算 ---
-    # 速度越快，阈值越小 (需要在停止线处于画面更上方/更远处时就反应)
-    # 0 km/h -> 0.85 (近)
-    # 50 km/h -> 0.50 (远)
-    # 限制范围 [0.45, 0.85] 防止误判
-    dynamic_threshold = 0.75 - (current_speed * 0.007)
-    dynamic_threshold = np.clip(dynamic_threshold, 0.45, 0.75)
-    # -------------------
+    stop_line_detected = False
+    max_y = -1
     
     if lines is not None:
         for line in lines:
@@ -81,15 +75,18 @@ def detect_stop_lines(lane_mask, current_speed=0.0):
             if x2 - x1 == 0: slope = 999.0
             else: slope = (y2 - y1) / (x2 - x1)
             
-            # 停止线判定：
-            # 1. 斜率水平
-            # 2. Y坐标大于动态阈值
-            if abs(slope) < 0.1 and min(y1, y2) > height * dynamic_threshold:
+            # 停止线判定：水平
+            # 阈值设为 0.35 (即画面上部 35% 处)，尽早检测
+            if abs(slope) < 0.15 and min(y1, y2) > height * 0.35: 
                 stop_line_detected = True
-                # 可选：打印调试信息看看阈值变化
-                # print(f"Speed: {current_speed:.1f}, Thresh: {dynamic_threshold:.2f}, LineY: {min(y1, y2)/height:.2f}")
-                break
-    return stop_line_detected
+                current_max_y = max(y1, y2)
+                if current_max_y > max_y:
+                    max_y = current_max_y
+
+    # 归一化 Y 坐标 (0.0 ~ 1.0)
+    line_y_norm = max_y / height if stop_line_detected else None
+    
+    return stop_line_detected, line_y_norm
 
 # --- YOLOP 检测类 ---
 class YOLOPDetector:
@@ -215,7 +212,7 @@ class MPCCarSimulation:
         self.yolo_model = None      # YOLOv11 (红绿灯 - 长焦)
         self.yolop_detector = None  # YOLOP (车道/路面 - 广角)
         
-        # --- 修改处：定义双目摄像头的队列和传感器变量 ---
+        # 定义摄像头的队列和传感器变量 ---
         self.wide_queue = queue.Queue() # 广角队列
         self.tele_queue = queue.Queue() # 长焦队列
         self.wide_sensor = None
@@ -271,7 +268,7 @@ class MPCCarSimulation:
         return env
     
     def _setup_sensors(self):
-        """设置双目摄像头系统 (广角 + 长焦)"""
+        """设置摄像头系统 (广角 + 长焦)"""
         if self.vehicle is None: return
 
         bp_library = self.env.world.get_blueprint_library()
@@ -281,12 +278,9 @@ class MPCCarSimulation:
         bp_wide.set_attribute('image_size_x', '1280')
         bp_wide.set_attribute('image_size_y', '720')
         bp_wide.set_attribute('fov', '90')
-        # 关键：设置为 0.0 确保每帧都生成数据
         bp_wide.set_attribute('sensor_tick', '0.0') 
         
         spawn_point_wide = carla.Transform(carla.Location(x=1.0, z=2.0))
-        
-        # --- 修改处：添加 attachment_type=carla.AttachmentType.Rigid ---
         self.wide_sensor = self.env.world.spawn_actor(
             bp_wide, spawn_point_wide, attach_to=self.env.ego_vehicle,
             attachment_type=carla.AttachmentType.Rigid
@@ -302,8 +296,6 @@ class MPCCarSimulation:
         bp_tele.set_attribute('sensor_tick', '0.0')
         
         spawn_point_tele = carla.Transform(carla.Location(x=1.0, z=2.0))
-        
-        # --- 修改处：添加 attachment_type=carla.AttachmentType.Rigid ---
         self.tele_sensor = self.env.world.spawn_actor(
             bp_tele, spawn_point_tele, attach_to=self.env.ego_vehicle,
             attachment_type=carla.AttachmentType.Rigid
@@ -407,6 +399,7 @@ class MPCCarSimulation:
         img_tele_vis = None
         tl_results = {}
         stop_line_detected = False
+        stop_line_y = None
         
         def get_latest_frame(q, timeout=2.0):
             try:
@@ -445,9 +438,9 @@ class MPCCarSimulation:
             if self.yolop_detector:
                 img_wide_vis, ll_mask, _ = self.yolop_detector.infer(raw_wide)
             
-            # --- 修改处：传入车速进行停止线检测 ---
+            # --- 传入车速进行停止线检测 ---
             if ll_mask is not None:
-                stop_line_detected = detect_stop_lines(ll_mask, current_speed)
+                stop_line_detected, stop_line_y = detect_stop_lines(ll_mask, current_speed)
             # -----------------------------------
 
             # --- 处理长焦图像 (Tele) ---
@@ -495,7 +488,7 @@ class MPCCarSimulation:
             import traceback
             traceback.print_exc()
             
-        return is_red_light, info_text, img_wide_vis, img_tele_vis, tl_results, stop_line_detected
+        return is_red_light, info_text, img_wide_vis, img_tele_vis, tl_results, stop_line_detected, stop_line_y
 
     def _is_vehicle_in_junction(self):
         """检查车辆是否在路口"""
@@ -584,40 +577,69 @@ class MPCCarSimulation:
         plt.tight_layout()
         plt.show()
     
-    def run_simulation(self, start_idx=80, end_idx=20):
+    def run_simulation(self, start_idx=75, end_idx=40):
         try:
             self._setup_route(start_idx, end_idx)
             self._initialize_vehicle_and_agent(start_idx, end_idx)
             if self.env.display_method == "pygame": self.env.init_display()
             self._setup_sensors()
             
-            # 获取初始的步长参数 (通常是 1.5)
-            # 注意：需确保 x_v2x_agent.py 中 self.dist_step 是可访问的
             cruise_speed = self.simulation_params['target_speed']
-            original_dist_step = 1.5 # 或者 self.agent.dist_step
-
+            original_dist_step = 1.5 
+            
+            # --- 参数微调 ---
+            # START_Y: 0.40 (更早开始减速，配合 detect_stop_lines 的优化)
+            # END_Y: 0.80 (留出一点余量，防止压线)
+            BRAKE_START_Y = 0.40  
+            BRAKE_END_Y = 0.80    
+            
             for step in range(self.simulation_params['max_simulation_steps']):
-                is_red, _, img_w, img_t, tl_res, is_stop = self._process_yolo_detection()
-                
-                # 先运行一步获取状态，或者放在后面也可以，关键是参数设置要在 run_step 之前
+                is_red, _, img_w, img_t, tl_res, is_stop, line_y = self._process_yolo_detection()
                 
                 brake_msg = ""
-                # --- 刹车逻辑 ---
-                if is_red and is_stop and not self._is_vehicle_in_junction():
-                    # 1. 设置目标速度为 0 (现在 bounds 已经放开，这会生效了)
-                    self.agent._model.set_target_velocity(0.0)
+                
+                if is_red and is_stop and line_y is not None and not self._is_vehicle_in_junction():
                     
-                    # 2. 【关键】锁定参考轨迹，不让它随车身惯性前移
-                    # 这样 MPC 才会为了消除位置误差而倾向于停在当前参考点
-                    self.agent.dist_step = 0.0 
+                    if line_y < BRAKE_START_Y:
+                        # 刚看到线，预备减速，先降一点点参考步长
+                        target_v = cruise_speed
+                        current_dist_step = original_dist_step * 0.8
+                        brake_msg = "RED LIGHT (FAR)"
+                        
+                    elif line_y > BRAKE_END_Y:
+                        # 到达停止位置 -> 锁死
+                        target_v = 0.0
+                        current_dist_step = 0.0 
+                        brake_msg = "STOPPING (ARRIVED)"
+                        
+                    else:
+                        # --- 核心修改：二次函数刹车曲线 ---
+                        # 计算接近程度 (0.0 -> 1.0)
+                        progress = (line_y - BRAKE_START_Y) / (BRAKE_END_Y - BRAKE_START_Y)
+                        progress = np.clip(progress, 0.0, 1.0)
+                        # 减速因子：使用平方函数 (1 - p)^2
+                        brake_factor = (1.0 - progress) ** 2
+                        
+                        # 额外的高速保护：如果速度很快但离线已经较近(p>0.5)，强制更大幅度减速
+                        current_v_kmh = self.agent._model.get_v() * 3.6
+                        #if current_v_kmh > 30 and progress > 0.4:
+                            # brake_factor *= 0.5 # 进一步减半
+                        
+                        target_v = cruise_speed * brake_factor
+                        
+                        # 参考轨迹步长也跟随平方律收缩
+                        current_dist_step = original_dist_step * brake_factor
+                        
+                        brake_msg = f"BRAKING {target_v:.1f} km/h"
+
+                    self.agent._model.set_target_velocity(target_v)
+                    self.agent.dist_step = current_dist_step
                     
-                    brake_msg = "BRAKING (MPC Target=0)"
                 else:
-                    # 恢复正常行驶
+                    # 恢复
                     self.agent._model.set_target_velocity(cruise_speed)
                     self.agent.dist_step = original_dist_step
-                # ----------------
-                
+
                 acc, steer, next_state = self.agent.run_step()
                 
                 self._record_simulation_data(step, next_state, acc, steer)
