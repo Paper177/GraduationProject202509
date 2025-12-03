@@ -58,6 +58,9 @@ class Vehicle:
         self.acc_lbound = -6.0
         self.acc_ubound = 3.0
         self.target_v = target_v / 3.6
+        
+        # --- 修改 1：添加一个固定的物理最高限速 (比如 60km/h) ---
+        self.max_speed = 60.0 / 3.6
 
     def get_state_carla(self):
         self.transform = self.actor.get_transform()
@@ -406,18 +409,19 @@ class Vehicle:
             self.ubx.append(self.steer_bound)
 
         # for state constraints
+        # for state constraints (大约在第 290 行附近)
         for _ in range(self.horizon+1):
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
-            self.lbx.append(-self.target_v)
+            self.lbx.append(-self.max_speed) 
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
 
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
-            self.ubx.append(self.target_v)
+            self.ubx.append(self.max_speed)
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
 

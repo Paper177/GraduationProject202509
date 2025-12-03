@@ -5,12 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="34f6f4fb-a573-452b-8d2e-c72b5be311b4" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/GraduationProject202509.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/GraduationProject202509.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/MarsCodeWorkspaceAppSettings.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/MarsCodeWorkspaceAppSettings.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Traffic_detection/main.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/Traffic_detection/simulation.py" beforeDir="false" afterPath="$PROJECT_DIR$/Traffic_detection/simulation.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/carla_MPC/test_main.py" beforeDir="false" afterPath="$PROJECT_DIR$/carla_MPC/test_main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/carla_MPC/MPC_Control_with_YOLOP2.py" beforeDir="false" afterPath="$PROJECT_DIR$/carla_MPC/MPC_Control_with_YOLOP2.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -41,17 +37,17 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.Traffic_detection_main.executor": "Run",
-    "Python.simulation.executor": "Debug",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "settings.editor.selected.configurable": "preferences.pluginManager"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.Traffic_detection_main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.simulation.executor&quot;: &quot;Debug&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;
   }
-}]]></component>
+}</component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>

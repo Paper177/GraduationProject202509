@@ -234,8 +234,7 @@ class CarlaYoloRunner(object):
         self.actors_to_destroy.append(self.ego_vehicle)
 
         # 2. 生成传感器
-        # 减小fov值以获得更大的焦段和更远的检测距离（默认70.0，改为45.0获得更远检测）
-        fov = 30.0
+        fov = 70.0
         camera_init_trans = carla.Transform(carla.Location(x=1.2, z=2.0))
         
         # RGB

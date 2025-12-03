@@ -189,9 +189,9 @@ class MPCCarSimulation:
         # ... (前面的参数保持不变) ...
         self.simulation_params = {
             'time_step': 0.05,
-            'target_speed': 30,
+            'target_speed': 45,
             'sample_resolution': 2.0,
-            'display_mode': "spec",
+            'display_mode': "pygame",
             'max_simulation_steps': 5000, 
             'destination_threshold': 1.0, 
             'map_name': "Town05"       
@@ -584,38 +584,40 @@ class MPCCarSimulation:
         plt.tight_layout()
         plt.show()
     
-    def run_simulation(self, start_idx=75, end_idx=40):
+    def run_simulation(self, start_idx=80, end_idx=20):
         try:
             self._setup_route(start_idx, end_idx)
             self._initialize_vehicle_and_agent(start_idx, end_idx)
             if self.env.display_method == "pygame": self.env.init_display()
-            
             self._setup_sensors()
             
-            # 定义正常巡航速度 (km/h)
+            # 获取初始的步长参数 (通常是 1.5)
+            # 注意：需确保 x_v2x_agent.py 中 self.dist_step 是可访问的
             cruise_speed = self.simulation_params['target_speed']
-            
+            original_dist_step = 1.5 # 或者 self.agent.dist_step
+
             for step in range(self.simulation_params['max_simulation_steps']):
-                # 1. 感知
                 is_red, _, img_w, img_t, tl_res, is_stop = self._process_yolo_detection()
                 
-                # 2. 决策：修改 MPC 目标速度
+                # 先运行一步获取状态，或者放在后面也可以，关键是参数设置要在 run_step 之前
+                
                 brake_msg = ""
-                
-                # 刹车条件：红灯 AND 停止线 AND 不在路口中间
-                if is_red and is_stop:
-                    # --- 关键修改：通过 MPC 设定目标速度为 0 来刹车 ---
-                    # 注意：agent._model 是 mcp_controller.py 中的 Vehicle 类实例
-                    # set_target_velocity 接收 km/h
-                    self.agent._model.set_target_velocity(0.0) 
-                    brake_msg = "BRAKING"
+                # --- 刹车逻辑 ---
+                if is_red and is_stop and not self._is_vehicle_in_junction():
+                    # 1. 设置目标速度为 0 (现在 bounds 已经放开，这会生效了)
+                    self.agent._model.set_target_velocity(0.0)
+                    
+                    # 2. 【关键】锁定参考轨迹，不让它随车身惯性前移
+                    # 这样 MPC 才会为了消除位置误差而倾向于停在当前参考点
+                    self.agent.dist_step = 0.0 
+                    
+                    brake_msg = "BRAKING (MPC Target=0)"
                 else:
-                    # --- 恢复正常巡航速度 ---
-                    # 必须显式设置回去，否则车辆会一直停着
+                    # 恢复正常行驶
                     self.agent._model.set_target_velocity(cruise_speed)
+                    self.agent.dist_step = original_dist_step
+                # ----------------
                 
-                # 3. 规划与控制：运行 MPC
-                # MPC 内部会读取刚才设置的 target_v 来生成轨迹
                 acc, steer, next_state = self.agent.run_step()
                 
                 self._record_simulation_data(step, next_state, acc, steer)
