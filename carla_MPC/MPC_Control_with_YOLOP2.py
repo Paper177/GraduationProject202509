@@ -60,8 +60,8 @@ def detect_stop_lines(lane_mask, current_speed=0.0):
     # ROI: 关注车道前方区域
     polygons = np.array([[
         (0, height), (width, height),
-        (int(width * 0.7), int(height * 0.55)), # 稍微调高 ROI 顶部
-        (int(width * 0.3), int(height * 0.55))
+        (int(width * 0.7), int(height * 0.30)), # 稍微调高 ROI 顶部到 0.30，确保 0.35 处的线能完整显示
+        (int(width * 0.3), int(height * 0.30))
     ]])
     cv2.fillPoly(mask, polygons, 255)
     masked_edges = cv2.bitwise_and(edges, mask)
@@ -143,27 +143,54 @@ class YOLOPDetector:
 
         img_h, img_w = img_rgb.shape[:2]
         
-        # 1. 预处理
-        img_resized = cv2.resize(img_rgb, (640, 640))
-        input_tensor = self.transform(img_resized).unsqueeze(0).to(self.device)
+        # 1. 预处理 - 使用 Letterbox 保持纵横比
+        target_size = 640
+        r = min(target_size / img_h, target_size / img_w)
+        new_h, new_w = int(img_h * r), int(img_w * r)
+        
+        img_resized = cv2.resize(img_rgb, (new_w, new_h))
+        
+        # 创建填充图像
+        pad_w = (target_size - new_w) // 2
+        pad_h = (target_size - new_h) // 2
+        
+        # 使用灰色填充 (114, 114, 114) 是 YOLO 系列的惯例
+        img_padded = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
+        img_padded[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = img_resized
+        
+        input_tensor = self.transform(img_padded).unsqueeze(0).to(self.device)
         
         # 2. 推理
         with torch.no_grad():
             det_out, da_seg_out, ll_seg_out = self.model(input_tensor)
             
         # 3. 后处理 - 分割掩码
+        # 需要去除 padding 并还原尺寸
+        
         # Drivable Area
-        da_seg_mask = torch.nn.functional.interpolate(da_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
-        da_seg_mask = torch.argmax(da_seg_mask, dim=1).squeeze().cpu().numpy() # 0 or 1
+        da_seg_out = da_seg_out[:, :, pad_h:pad_h+new_h, pad_w:pad_w+new_w]
+        # 使用 Softmax 获取概率
+        da_seg_prob = torch.nn.functional.softmax(da_seg_out, dim=1)[:, 1, :, :].unsqueeze(1)
+        da_seg_mask = torch.nn.functional.interpolate(da_seg_prob, size=(img_h, img_w), mode='bilinear', align_corners=True).squeeze()
+        # 阈值过滤 (0.5)
+        da_seg_mask = (da_seg_mask > 0.5).float().cpu().numpy()
         da_seg_mask = (da_seg_mask * 255).astype(np.uint8)
         
         # Lane Line
-        ll_seg_mask = torch.nn.functional.interpolate(ll_seg_out, size=(img_h, img_w), mode='bilinear', align_corners=True)
-        ll_seg_mask = torch.argmax(ll_seg_mask, dim=1).squeeze().cpu().numpy() # 0 or 1
+        ll_seg_out = ll_seg_out[:, :, pad_h:pad_h+new_h, pad_w:pad_w+new_w]
+        # 使用 Softmax 获取概率
+        ll_seg_prob = torch.nn.functional.softmax(ll_seg_out, dim=1)[:, 1, :, :].unsqueeze(1)
+        ll_seg_mask = torch.nn.functional.interpolate(ll_seg_prob, size=(img_h, img_w), mode='bilinear', align_corners=True).squeeze()
+        # 阈值过滤 (0.5) - 可以根据需要调整，例如 0.6 以减少噪声
+        ll_seg_mask = (ll_seg_mask > 0.5).float().cpu().numpy()
         ll_seg_mask = (ll_seg_mask * 255).astype(np.uint8)
         
-        # --- 处理车辆检测 --- 
-        # (车辆检测代码已移除)
+        # --- 形态学操作优化掩码 ---
+        kernel = np.ones((3, 3), np.uint8)
+        # 对车道线进行闭运算，连接断裂的线
+        ll_seg_mask = cv2.morphologyEx(ll_seg_mask, cv2.MORPH_CLOSE, kernel)
+        # 对可行驶区域进行开运算，去除噪点
+        da_seg_mask = cv2.morphologyEx(da_seg_mask, cv2.MORPH_OPEN, kernel)
         
         # 4. 可视化叠加
         img_vis = img_rgb.copy()
@@ -177,7 +204,6 @@ class YOLOPDetector:
             img_vis[mask_bool] = cv2.addWeighted(img_vis[mask_bool], 0.7, color_area[mask_bool], 0.3, 0).squeeze()
         
         # 绘制车道线 (绿色)
-        # 这里的 ll_seg_mask 已经是二值化的边缘了，可以直接用来显示
         img_vis[ll_seg_mask > 100] = [0, 255, 0] # RGB: Green
         
         return img_vis, ll_seg_mask, da_seg_mask
@@ -280,12 +306,12 @@ class MPCCarSimulation:
         
         # --- 1. 广角摄像头 (Wide) ---
         bp_wide = bp_library.find('sensor.camera.rgb')
-        bp_wide.set_attribute('image_size_x', '1280')
-        bp_wide.set_attribute('image_size_y', '720')
-        bp_wide.set_attribute('fov', '90')
+        bp_wide.set_attribute('image_size_x', '1920')
+        bp_wide.set_attribute('image_size_y', '1080')
+        bp_wide.set_attribute('fov', '110')
         bp_wide.set_attribute('sensor_tick', '0.0') 
         
-        spawn_point_wide = carla.Transform(carla.Location(x=1.0, z=2.0))
+        spawn_point_wide = carla.Transform(carla.Location(x=1.0, z=2.0), carla.Rotation(pitch=-15.0))
         self.wide_sensor = self.env.world.spawn_actor(
             bp_wide, spawn_point_wide, attach_to=self.env.ego_vehicle,
             attachment_type=carla.AttachmentType.Rigid
@@ -381,7 +407,7 @@ class MPCCarSimulation:
             # 简单的拼接（实际应用中可能需要去重连接点，这里直接extend）
             self.route.extend(segment)
             
-        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
+        #draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
         # 车辆重生在序列的第一个点
         self.env.reset(spawn_point=self.spawn_points[waypoints_idxs[0]])
         
@@ -531,10 +557,10 @@ class MPCCarSimulation:
                 dh, dw = da_mask.shape
                 # --- 定义梯形 ROI (Trapezoid) ---
                 roi_cnt = np.array([
-                    [int(dw * 0.48), int(dh * 0.51)],  # Top-Left
-                    [int(dw * 0.52), int(dh * 0.51)],  # Top-Right
-                    [int(dw * 0.73), dh],              # Bottom-Right
-                    [int(dw * 0.27), dh]               # Bottom-Left
+                    [int(dw * 0.48), int(dh * 0.35)],  # Top-Left
+                    [int(dw * 0.52), int(dh * 0.35)],  # Top-Right
+                    [int(dw * 0.65), int(dh * 0.65)],              # Bottom-Right
+                    [int(dw * 0.35), int(dh * 0.65)]               # Bottom-Left
                 ], np.int32)
 
                 # 创建 ROI 掩码
@@ -695,10 +721,10 @@ class MPCCarSimulation:
         plt.tight_layout()
         plt.show()
     
-    def run_simulation(self, start_idx=93, end_idx=42):
+    def run_simulation(self, start_idx=93, end_idx=199):
         try:
             # 定义包含中间点的完整路径序列
-            route_waypoints = [start_idx, 277, end_idx]
+            route_waypoints = [start_idx, 277, 42,69, 95,244,190,end_idx]
             print(f"Planning route via points: {route_waypoints}")
             
             self._setup_route(route_waypoints)
@@ -713,10 +739,10 @@ class MPCCarSimulation:
             original_dist_step = 1.5 
             
             # --- 参数微调 ---
-            # START_Y: 0.40 (更早开始减速，配合 detect_stop_lines 的优化)
-            # END_Y: 0.80 (留出一点余量，防止压线)
-            BRAKE_START_Y = 0.40  
-            BRAKE_END_Y = 0.90    
+            # START_Y: 0.35 (更早开始减速，配合 detect_stop_lines 的优化)
+            # END_Y: 0.60 (留出一点余量，防止压线)
+            BRAKE_START_Y = 0.35  
+            BRAKE_END_Y = 0.60    
             
             for step in range(self.simulation_params['max_simulation_steps']):
                 is_red, _, img_w, img_t, tl_res, is_stop, line_y, is_collision = self._process_yolo_detection()
@@ -737,7 +763,7 @@ class MPCCarSimulation:
                     
                     if line_y < BRAKE_START_Y:
                         # 刚看到线，预备减速，先降一点点参考步长
-                        target_v = cruise_speed
+                        target_v = cruise_speed * 0.8
                         current_dist_step = original_dist_step * 0.8
                         brake_msg = "RED LIGHT (FAR)"
                         
@@ -747,17 +773,19 @@ class MPCCarSimulation:
                         current_dist_step = 0.0 
                         brake_msg = "STOPPING (ARRIVED)"
                         
-                    else:
-                        # --- 核心修改：二次函数刹车曲线 ---
+                    else:   
+                        # --- 核心修改：更丝滑的刹车曲线 ---
                         progress = (line_y - BRAKE_START_Y) / (BRAKE_END_Y - BRAKE_START_Y)
                         progress = np.clip(progress, 0.0, 1.0)
-                        # 减速因子：使用平方函数 (1 - p)^2
-                        brake_factor = (1.0 - progress) ** 0.5
+                        
+                        # 使用余弦函数实现更平滑的过渡 (S型曲线的前半段)
+                        # 当 progress=0 时 factor=1, progress=1 时 factor=0
+                        brake_factor = 0.5 * (1 + np.cos(progress * np.pi))
                         
                         target_v = cruise_speed * brake_factor
                         
-                        # 参考轨迹步长也跟随平方律收缩
-                        current_dist_step = original_dist_step * brake_factor
+                        # 参考轨迹步长也跟随收缩，但保持最小步长以维持控制稳定性
+                        current_dist_step = max(0.1, original_dist_step * brake_factor)
                         
                         brake_msg = f"BRAKING {target_v:.1f} km/h"
 
