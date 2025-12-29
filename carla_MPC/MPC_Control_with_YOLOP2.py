@@ -173,7 +173,7 @@ class YOLOPDetector:
         da_seg_prob = torch.nn.functional.softmax(da_seg_out, dim=1)[:, 1, :, :].unsqueeze(1)
         da_seg_mask = torch.nn.functional.interpolate(da_seg_prob, size=(img_h, img_w), mode='bilinear', align_corners=True).squeeze()
         # 阈值过滤 (0.5)
-        da_seg_mask = (da_seg_mask > 0.5).float().cpu().numpy()
+        da_seg_mask = (da_seg_mask > 0.49).float().cpu().numpy()
         da_seg_mask = (da_seg_mask * 255).astype(np.uint8)
         
         # Lane Line
@@ -182,7 +182,7 @@ class YOLOPDetector:
         ll_seg_prob = torch.nn.functional.softmax(ll_seg_out, dim=1)[:, 1, :, :].unsqueeze(1)
         ll_seg_mask = torch.nn.functional.interpolate(ll_seg_prob, size=(img_h, img_w), mode='bilinear', align_corners=True).squeeze()
         # 阈值过滤 (0.5) - 可以根据需要调整，例如 0.6 以减少噪声
-        ll_seg_mask = (ll_seg_mask > 0.5).float().cpu().numpy()
+        ll_seg_mask = (ll_seg_mask > 0.49).float().cpu().numpy()
         ll_seg_mask = (ll_seg_mask * 255).astype(np.uint8)
         
         # --- 形态学操作优化掩码 ---
@@ -550,7 +550,7 @@ class MPCCarSimulation:
                 stop_line_detected, stop_line_y = detect_stop_lines(ll_mask, current_speed)
             # -----------------------------------
 
-            # --- 3. 基于可行驶区域的碰撞风险检测 (新功能) ---
+            # --- 3. 基于可行驶区域的碰撞风险检测 ---
 
             collision_risk = False
             if da_mask is not None:
@@ -575,7 +575,7 @@ class MPCCarSimulation:
                 drivable_ratio = drivable_pixels / total_roi_pixels if total_roi_pixels > 0 else 0.0
                 
                 # 如果可行驶区域占比小于 0.3 (即大部分是不可行驶的)
-                if drivable_ratio < 0.3:
+                if drivable_ratio < 0.35:
                     collision_risk = True
                     info_text = "COLLISION RISK!"
         
@@ -742,7 +742,7 @@ class MPCCarSimulation:
             # START_Y: 0.35 (更早开始减速，配合 detect_stop_lines 的优化)
             # END_Y: 0.60 (留出一点余量，防止压线)
             BRAKE_START_Y = 0.35  
-            BRAKE_END_Y = 0.60    
+            BRAKE_END_Y = 0.65    
             
             for step in range(self.simulation_params['max_simulation_steps']):
                 is_red, _, img_w, img_t, tl_res, is_stop, line_y, is_collision = self._process_yolo_detection()
