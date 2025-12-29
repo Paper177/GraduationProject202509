@@ -8,6 +8,7 @@ import pathlib
 import queue
 import cv2
 import os
+import random
 
 # --- 添加路径以导入 Traffic_detection 模块 ---
 traffic_detection_path = pathlib.Path(__file__).parent.parent / 'Traffic_detection'
@@ -25,6 +26,7 @@ except ImportError as e:
 
 try:
     import torch
+    import torchvision
     import torchvision.transforms as transforms
     TORCH_AVAILABLE = True
 except ImportError:
@@ -49,8 +51,8 @@ def detect_stop_lines(lane_mask, current_speed=0.0):
     height, width = lane_mask.shape[:2]
     
     # 简单的形态学操作，连接断裂的线 (可选)
-    # kernel = np.ones((3,3), np.uint8)
-    # lane_mask = cv2.dilate(lane_mask, kernel, iterations=1)
+    kernel = np.ones((3,3), np.uint8)
+    lane_mask = cv2.dilate(lane_mask, kernel, iterations=1)
     
     edges = lane_mask
     mask = np.zeros_like(edges)
@@ -160,6 +162,9 @@ class YOLOPDetector:
         ll_seg_mask = torch.argmax(ll_seg_mask, dim=1).squeeze().cpu().numpy() # 0 or 1
         ll_seg_mask = (ll_seg_mask * 255).astype(np.uint8)
         
+        # --- 处理车辆检测 --- 
+        # (车辆检测代码已移除)
+        
         # 4. 可视化叠加
         img_vis = img_rgb.copy()
         
@@ -186,7 +191,7 @@ class MPCCarSimulation:
         # ... (前面的参数保持不变) ...
         self.simulation_params = {
             'time_step': 0.05,
-            'target_speed': 45,
+            'target_speed': 30,
             'sample_resolution': 2.0,
             'display_mode': "pygame",
             'max_simulation_steps': 5000, 
@@ -305,18 +310,83 @@ class MPCCarSimulation:
         
         print("Dual Camera System initialized (Rigid Attachment).")
 
-    def _setup_route(self, start_idx, end_idx):
-        """规划全局路径"""
-        route_planner = GlobalRoutePlanner(self.env.map, self.simulation_params['sample_resolution'])
-        self.route = route_planner.trace_route(
-            self.spawn_points[start_idx].location, 
-            self.spawn_points[end_idx].location
-        )
-        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
-        self.env.reset(spawn_point=self.spawn_points[start_idx])
+    def _spawn_traffic(self, num_vehicles=30, num_walkers=20):
+        """生成交通流（车辆和行人）"""
+        print(f"Spawning {num_vehicles} vehicles and {num_walkers} walkers...")
         
-    def _initialize_vehicle_and_agent(self, start_idx, end_idx):
-        """初始化车辆和 MPC 智能体"""
+        bp_lib = self.env.world.get_blueprint_library()
+        spawn_points = self.spawn_points
+        
+        # --- 1. 生成车辆 ---
+        vehicle_bps = bp_lib.filter('vehicle.*')
+        vehicle_bps = [x for x in vehicle_bps if int(x.get_attribute('number_of_wheels')) == 4]
+        
+        number_of_spawn_points = len(spawn_points)
+        if num_vehicles < number_of_spawn_points:
+            random.shuffle(spawn_points)
+        elif num_vehicles > number_of_spawn_points:
+            msg = 'requested %d vehicles, but could only find %d spawn points'
+            print(msg % (num_vehicles, number_of_spawn_points))
+            num_vehicles = number_of_spawn_points
+
+        for n, transform in enumerate(spawn_points):
+            if n >= num_vehicles:
+                break
+            blueprint = random.choice(vehicle_bps)
+            if blueprint.has_attribute('color'):
+                color = random.choice(blueprint.get_attribute('color').recommended_values)
+                blueprint.set_attribute('color', color)
+            blueprint.set_attribute('role_name', 'autopilot')
+
+            vehicle = self.env.world.try_spawn_actor(blueprint, transform)
+            if vehicle is not None:
+                vehicle.set_autopilot(True)
+                self.env.actor_list.append(vehicle)
+
+        # --- 2. 生成行人 ---
+        walker_bps = bp_lib.filter('walker.pedestrian.*')
+        walker_controller_bp = bp_lib.find('controller.ai.walker')
+        
+        for i in range(num_walkers):
+            spawn_loc = self.env.world.get_random_location_from_navigation()
+            if spawn_loc is not None:
+                walker_bp = random.choice(walker_bps)
+                if walker_bp.has_attribute('is_invincible'):
+                    walker_bp.set_attribute('is_invincible', 'false')
+                    
+                walker = self.env.world.try_spawn_actor(walker_bp, carla.Transform(spawn_loc))
+                if walker is not None:
+                    self.env.actor_list.append(walker)
+                    # 为行人添加控制器
+                    controller = self.env.world.try_spawn_actor(walker_controller_bp, carla.Transform(), attach_to=walker)
+                    if controller is not None:
+                        self.env.actor_list.append(controller)
+                        controller.start()
+                        controller.go_to_location(self.env.world.get_random_location_from_navigation())
+                        controller.set_max_speed(5 + random.random())  
+
+        print("Traffic spawned.")
+
+    def _setup_route(self, waypoints_idxs):
+        """规划全局路径 (支持多点序列)"""
+        route_planner = GlobalRoutePlanner(self.env.map, self.simulation_params['sample_resolution'])
+        self.route = []
+        
+        # 循环连接所有路径点
+        for i in range(len(waypoints_idxs) - 1):
+            start_loc = self.spawn_points[waypoints_idxs[i]].location
+            end_loc = self.spawn_points[waypoints_idxs[i+1]].location
+            segment = route_planner.trace_route(start_loc, end_loc)
+            
+            # 简单的拼接（实际应用中可能需要去重连接点，这里直接extend）
+            self.route.extend(segment)
+            
+        draw_waypoints(self.env.world, [wp for wp, _ in self.route], z=0.5, color=(0, 255, 0))
+        # 车辆重生在序列的第一个点
+        self.env.reset(spawn_point=self.spawn_points[waypoints_idxs[0]])
+        
+    def _initialize_vehicle_and_agent(self, waypoints_idxs):
+        """初始化车辆和 MPC 智能体 (支持多点序列)"""
         self.vehicle = Vehicle(
             actor=self.env.ego_vehicle, horizon=10, 
             target_v=self.simulation_params['target_speed'],
@@ -324,8 +394,18 @@ class MPCCarSimulation:
         )
         
         self.agent = Xagent(self.env, self.vehicle, dt=self.simulation_params['time_step'])
-        self.agent.set_start_end_transforms(start_idx, end_idx)
-        self.agent.plan_route(self.agent._start_transform, self.agent._end_transform)
+        
+        # 设置起点和终点 transform (取序列首尾)
+        self.agent.set_start_end_transforms(waypoints_idxs[0], waypoints_idxs[-1])
+        
+        # 循环调用 plan_route 添加路径点到队列
+        # 获取所有对应的 Transform
+        route_transforms = [self.spawn_points[i] for i in waypoints_idxs]
+        
+        for i in range(len(route_transforms) - 1):
+            start_t = route_transforms[i]
+            end_t = route_transforms[i+1]
+            self.agent.plan_route(start_t, end_t)
     
     def _update_pygame_display(self, step, is_red=False, is_stop=False, brake_info="", yolo_data=None):
         """
@@ -435,13 +515,51 @@ class MPCCarSimulation:
             img_wide_vis = raw_wide.copy()
             
             ll_mask = None
+            da_mask = None  # 初始化 da_mask
             if self.yolop_detector:
-                img_wide_vis, ll_mask, _ = self.yolop_detector.infer(raw_wide)
+                img_wide_vis, ll_mask, da_mask = self.yolop_detector.infer(raw_wide)
             
             # --- 传入车速进行停止线检测 ---
             if ll_mask is not None:
                 stop_line_detected, stop_line_y = detect_stop_lines(ll_mask, current_speed)
             # -----------------------------------
+
+            # --- 3. 基于可行驶区域的碰撞风险检测 (新功能) ---
+
+            collision_risk = False
+            if da_mask is not None:
+                dh, dw = da_mask.shape
+                # --- 定义梯形 ROI (Trapezoid) ---
+                roi_cnt = np.array([
+                    [int(dw * 0.48), int(dh * 0.51)],  # Top-Left
+                    [int(dw * 0.52), int(dh * 0.51)],  # Top-Right
+                    [int(dw * 0.73), dh],              # Bottom-Right
+                    [int(dw * 0.27), dh]               # Bottom-Left
+                ], np.int32)
+
+                # 创建 ROI 掩码
+                roi_mask = np.zeros_like(da_mask)
+                cv2.fillPoly(roi_mask, [roi_cnt], 255)
+                
+                # 计算可行驶区域像素占比
+                # 仅计算 ROI 掩码内的区域
+                total_roi_pixels = np.sum(roi_mask > 0)
+                drivable_pixels = np.sum((da_mask > 128) & (roi_mask > 0))
+                
+                drivable_ratio = drivable_pixels / total_roi_pixels if total_roi_pixels > 0 else 0.0
+                
+                # 如果可行驶区域占比小于 0.3 (即大部分是不可行驶的)
+                if drivable_ratio < 0.3:
+                    collision_risk = True
+                    info_text = "COLLISION RISK!"
+        
+                    # 可视化：红色梯形框
+                    cv2.polylines(img_wide_vis, [roi_cnt], True, (0, 0, 255), 3)
+                    cv2.putText(img_wide_vis, "BLOCK", (roi_cnt[0][0], roi_cnt[0][1]-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                else:
+                    # 可视化：绿色梯形框
+                    cv2.polylines(img_wide_vis, [roi_cnt], True, (0, 255, 0), 1)
 
             # --- 处理长焦图像 (Tele) ---
             array_tele = np.frombuffer(data_tele.raw_data, dtype=np.dtype("uint8"))
@@ -488,7 +606,7 @@ class MPCCarSimulation:
             import traceback
             traceback.print_exc()
             
-        return is_red_light, info_text, img_wide_vis, img_tele_vis, tl_results, stop_line_detected, stop_line_y
+        return is_red_light, info_text, img_wide_vis, img_tele_vis, tl_results, stop_line_detected, stop_line_y, collision_risk
 
     def _is_vehicle_in_junction(self):
         """检查车辆是否在路口"""
@@ -577,12 +695,19 @@ class MPCCarSimulation:
         plt.tight_layout()
         plt.show()
     
-    def run_simulation(self, start_idx=75, end_idx=40):
+    def run_simulation(self, start_idx=93, end_idx=42):
         try:
-            self._setup_route(start_idx, end_idx)
-            self._initialize_vehicle_and_agent(start_idx, end_idx)
+            # 定义包含中间点的完整路径序列
+            route_waypoints = [start_idx, 277, end_idx]
+            print(f"Planning route via points: {route_waypoints}")
+            
+            self._setup_route(route_waypoints)
+            self._initialize_vehicle_and_agent(route_waypoints)
             if self.env.display_method == "pygame": self.env.init_display()
             self._setup_sensors()
+            
+            # --- 添加交通流 ---
+            self._spawn_traffic(num_vehicles=30, num_walkers=20)
             
             cruise_speed = self.simulation_params['target_speed']
             original_dist_step = 1.5 
@@ -591,14 +716,24 @@ class MPCCarSimulation:
             # START_Y: 0.40 (更早开始减速，配合 detect_stop_lines 的优化)
             # END_Y: 0.80 (留出一点余量，防止压线)
             BRAKE_START_Y = 0.40  
-            BRAKE_END_Y = 0.80    
+            BRAKE_END_Y = 0.90    
             
             for step in range(self.simulation_params['max_simulation_steps']):
-                is_red, _, img_w, img_t, tl_res, is_stop, line_y = self._process_yolo_detection()
+                is_red, _, img_w, img_t, tl_res, is_stop, line_y, is_collision = self._process_yolo_detection()
                 
                 brake_msg = ""
                 
-                if is_red and is_stop and line_y is not None and not self._is_vehicle_in_junction():
+                # 优先级 1: 碰撞避免 (基于可行驶区域)
+                if is_collision:
+                    target_v = 0.0
+                    current_dist_step = 0.0
+                    brake_msg = "EMERGENCY BRAKE (DA)"
+                    
+                    self.agent._model.set_target_velocity(target_v)
+                    self.agent.dist_step = current_dist_step
+                
+                # 优先级 2: 红灯 + 停止线
+                elif is_red and is_stop and line_y is not None and not self._is_vehicle_in_junction():
                     
                     if line_y < BRAKE_START_Y:
                         # 刚看到线，预备减速，先降一点点参考步长
@@ -614,16 +749,10 @@ class MPCCarSimulation:
                         
                     else:
                         # --- 核心修改：二次函数刹车曲线 ---
-                        # 计算接近程度 (0.0 -> 1.0)
                         progress = (line_y - BRAKE_START_Y) / (BRAKE_END_Y - BRAKE_START_Y)
                         progress = np.clip(progress, 0.0, 1.0)
                         # 减速因子：使用平方函数 (1 - p)^2
-                        brake_factor = (1.0 - progress) ** 2
-                        
-                        # 额外的高速保护：如果速度很快但离线已经较近(p>0.5)，强制更大幅度减速
-                        current_v_kmh = self.agent._model.get_v() * 3.6
-                        #if current_v_kmh > 30 and progress > 0.4:
-                            # brake_factor *= 0.5 # 进一步减半
+                        brake_factor = (1.0 - progress) ** 0.5
                         
                         target_v = cruise_speed * brake_factor
                         
